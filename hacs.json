@@ -1,0 +1,6 @@
+{
+  "name": "Neakasa Litter Card",
+  "render_readme": true,
+  "filename": "neakasa-litter-card.js",
+  "homeassistant": "2024.2.0"
+}
