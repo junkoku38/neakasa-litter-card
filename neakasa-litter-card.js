@@ -129,6 +129,23 @@ const NK_CSS = `
   .mini { height: 24px; margin-top: 6px; }
   .mini svg { width: 100%; height: 100%; overflow: visible; display: block; }
   .mini:empty { display: none; }
+  .visits { font-size: 12px; color: var(--nk-dim); margin-top: 2px; }
+  .visits b { color: var(--nk-text); font-weight: 600; }
+
+  .actions { display: flex; gap: 8px; margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--nk-line); align-items: center; }
+  .actions .btn { width: 52px; }
+  .actions .spacer { flex: 1; }
+  .toggles { display: flex; gap: 4px; }
+  .tg {
+    display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px;
+    border-radius: 50%; cursor: pointer; --mdc-icon-size: 18px;
+    background: rgba(255,255,255,.06); border: 1px solid transparent; color: var(--nk-faint);
+    transition: color .2s, background .2s;
+  }
+  .tg:hover { background: rgba(255,255,255,.11); }
+  .tg:focus-visible { outline: 2px solid var(--nk-sand); outline-offset: 2px; }
+  .tg.on { color: var(--nk-sand); background: rgba(200,185,142,.14); }
+  .tg.off { color: var(--nk-faint); }
 
   .week { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--nk-line); }
   .wk { display: flex; flex-direction: column; align-items: center; gap: 5px; min-width: 0; }
@@ -202,8 +219,13 @@ class NeakasaLitterCard extends HTMLElement {
         litter_state: null,
         bin_state: `binary_sensor.${p}_waste_bucket_full`,
         clean: `button.${p}_clean_now`,
-        // visites par chat et par jour via historique des *_visits_today
+        needs_cleaning: `binary_sensor.${p}_needs_cleaning`,
+        level: `button.${p}_level_now`,
         visits_today: `sensor.${p}_visits_today`,
+        auto_clean: `switch.${p}_auto_clean`,
+        auto_level: `switch.${p}_auto_level`,
+        child_lock: `switch.${p}_child_lock`,
+        silent_mode: `switch.${p}_silent_mode`,
       };
     } else {
       this._config.integration = 'legacy';
@@ -229,7 +251,7 @@ class NeakasaLitterCard extends HTMLElement {
     this._lastUsage = hass.states[e.last_usage]?.state;
     this._lastStatus = hass.states[e.status]?.state;
     this._lastBin = hass.states[e.bin_state]?.state;
-    if (NK_BUSY.includes(this._lastStatus)) this._armed = false;
+    if (NK_BUSY.includes(this._lastStatus)) { this._armed = false; this._armedLvl = false; }
     this._render();
     if (needFetch) this._fetch();
   }
@@ -239,12 +261,21 @@ class NeakasaLitterCard extends HTMLElement {
     this._connected = true;
     const root = this.shadowRoot;
     root.addEventListener('click', (ev) => {
-      if (ev.target.closest('.btn')) { this._onClean(); return; }
+      const btn = ev.target.closest('.btn');
+      if (btn) {
+        if (btn.dataset.act === 'level') this._onLevel();
+        else this._onClean();
+        return;
+      }
+      const tg = ev.target.closest('[data-toggle]');
+      if (tg) { this._onToggle(tg.dataset.toggle); return; }
       const t = ev.target.closest('[data-more]');
       if (t) this._moreInfo(t.dataset.more);
     });
     root.addEventListener('keydown', (ev) => {
       if (ev.key !== 'Enter' && ev.key !== ' ') return;
+      const tg = ev.target.closest?.('[data-toggle]');
+      if (tg) { ev.preventDefault(); this._onToggle(tg.dataset.toggle); return; }
       const t = ev.target.closest?.('[data-more]');
       if (t) { ev.preventDefault(); this._moreInfo(t.dataset.more); }
     });
@@ -257,6 +288,7 @@ class NeakasaLitterCard extends HTMLElement {
     clearInterval(this._tick);
     clearInterval(this._poll);
     clearTimeout(this._armT);
+    clearTimeout(this._armTLvl);
   }
 
   getCardSize() { return 7; }
@@ -300,10 +332,14 @@ class NeakasaLitterCard extends HTMLElement {
     const c = this._config, S = this._hass.states;
     const list = [];
     const seen = new Set();
-    const add = (name, id, visitId) => {
+    const add = (name, id, visitId, visitsId) => {
       if (!id || seen.has(id) || !S[id]) return;
       seen.add(id);
-      list.push({ name: String(name), id, visitId: visitId && S[visitId] ? visitId : null });
+      list.push({
+        name: String(name), id,
+        visitId: visitId && S[visitId] ? visitId : null,
+        visitsId: visitsId && S[visitsId] ? visitsId : null,
+      });
     };
     const slug = nkSlug(c.cat_name);
     const explicit = Array.isArray(c.cats) && c.cats.length > 0;
@@ -311,7 +347,7 @@ class NeakasaLitterCard extends HTMLElement {
     if (c.integration === 'litterbox') {
       // roquerodrigo : sensor.<chat>_weight, sensor.<chat>_last_visit, sensor.<chat>_visits_today
       if (explicit) {
-        c.cats.forEach((n) => add(n, `sensor.${nkSlug(n)}_weight`, `sensor.${nkSlug(n)}_last_visit`));
+        c.cats.forEach((n) => add(n, `sensor.${nkSlug(n)}_weight`, `sensor.${nkSlug(n)}_last_visit`, `sensor.${nkSlug(n)}_visits_today`));
       } else {
         const re = /^sensor\.([a-z0-9_]+)_weight$/;
         Object.keys(S).forEach((id) => {
@@ -322,11 +358,11 @@ class NeakasaLitterCard extends HTMLElement {
           const st = S[id];
           // ne garder que les capteurs issus de l'intégration (unité kg ou lbs)
           if (!/^(kg|lb|lbs)$/i.test(String(st.attributes?.unit_of_measurement ?? 'kg'))) return;
-          add(nkUnslug(k), id, `sensor.${k}_last_visit`);
+          add(nkUnslug(k), id, `sensor.${k}_last_visit`, `sensor.${k}_visits_today`);
         });
         list.sort((a, b) => a.name.localeCompare(b.name, 'fr'));
       }
-      if (!list.length) add(c.cat_name, `sensor.${slug}_weight`, `sensor.${slug}_last_visit`);
+      if (!list.length) add(c.cat_name, `sensor.${slug}_weight`, `sensor.${slug}_last_visit`, `sensor.${slug}_visits_today`);
     } else {
       // legacy hass-neakasa : sensor.<prefix>_cat_<slug>
       const esc = String(c.prefix || 'neakasa_m1').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -434,10 +470,22 @@ class NeakasaLitterCard extends HTMLElement {
         const col = pct >= 5 ? 'var(--nk-warn)' : 'var(--nk-dim)';
         delta = `<span class="d" style="color:${col}">${Math.abs(g) < 20 ? 'stable' : `${g > 0 ? '+' : '−'}${Math.abs(g)} g`} sur ${old.i + 1} j</span>`;
       }
-      return { ...k, ok, wNow, weights, delta, mini: this._mini(weights) };
+      const vToday = k.visitsId ? parseInt(S[k.visitsId]?.state, 10) : NaN;
+      return { ...k, ok, wNow, weights, delta, mini: this._mini(weights), vToday: isNaN(vToday) ? null : vToday };
     });
 
-    return { now, today, dayIdx, visits, perDay, prev, cycles, lastClean, emptiedAt, sinceEmpty, binEta, cats };
+    // Toggles réels (absents de l'entité = non affichés)
+    const switches = [
+      ['auto_clean', 'Nettoyage auto', 'mdi:broom'],
+      ['auto_level', 'Nivelage auto', 'mdi:layers'],
+      ['silent_mode', 'Mode silencieux', 'mdi:volume-mute'],
+      ['child_lock', 'Verrouillage', 'mdi:lock'],
+    ].map(([key, label, icon]) => ({ key, label, icon, id: e[key] }))
+      .filter((s) => s.id && S[s.id]);
+
+    const needsCleaning = e.needs_cleaning && S[e.needs_cleaning] ? S[e.needs_cleaning].state === 'on' : false;
+
+    return { now, today, dayIdx, visits, perDay, prev, cycles, lastClean, emptiedAt, sinceEmpty, binEta, cats, switches, needsCleaning };
   }
 
   /* ───────────── Cadran 24 h × 7 jours ───────────── */
@@ -656,6 +704,9 @@ class NeakasaLitterCard extends HTMLElement {
     }
 
     const armed = this._armed && !catIn && !busy;
+    const armedLvl = this._armedLvl && !catIn && !busy;
+    const canLevel = !!(e.level && S[e.level]);
+    const canClean = !!(e.clean && S[e.clean]);
 
     this.shadowRoot.innerHTML = `
       <style>${NK_CSS}</style>
@@ -665,11 +716,18 @@ class NeakasaLitterCard extends HTMLElement {
           <div class="who">
             <div class="title">${c.name} · ${c.room}</div>
             <div class="sub ${subCls}">${sub}</div>
+            ${D.needsCleaning ? '<div class="sub alert">Besoin de nettoyage</div>' : ''}
           </div>
-          <button class="btn ${armed ? 'armed' : ''}" ${catIn || busy || !S[e.clean] ? 'disabled' : ''}
+          ${canLevel ? `
+          <button class="btn ${armedLvl ? 'armed' : ''}" data-act="level" ${catIn || busy ? 'disabled' : ''}
+            title="${armedLvl ? 'Appuie encore pour confirmer' : 'Niveler la litière'}" aria-label="${armedLvl ? 'Confirmer le nivelage' : 'Niveler la litière'}">
+            <ha-icon icon="${armedLvl ? 'mdi:check' : 'mdi:layers'}"></ha-icon>
+          </button>` : ''}
+          ${canClean ? `
+          <button class="btn ${armed ? 'armed' : ''}" data-act="clean" ${catIn || busy ? 'disabled' : ''}
             title="${armed ? 'Appuie encore pour confirmer' : 'Lancer un nettoyage'}" aria-label="${armed ? 'Confirmer le nettoyage' : 'Lancer un nettoyage'}">
             <ha-icon icon="${armed ? 'mdi:check' : 'mdi:shimmer'}"></ha-icon>
-          </button>
+          </button>` : ''}
         </div>
 
         <div class="main">
@@ -689,6 +747,7 @@ class NeakasaLitterCard extends HTMLElement {
               <div class="label">Poids · ${k.name}</div>
               <div class="w"><span class="kg">${k.ok ? nkNum(k.wNow, 2) : '—'} kg</span>${k.delta}</div>
               <div class="mini">${k.mini}</div>
+              ${k.vToday !== null ? `<div class="visits">${k.vToday} passage${k.vToday > 1 ? 's' : ''} aujourd'hui</div>` : ''}
             </div>`).join('')}</div>` : ''}
           </div>
         </div>
@@ -707,6 +766,16 @@ class NeakasaLitterCard extends HTMLElement {
             <div class="t">${binTxt}</div>
           </div>
         </div>
+
+        ${D.switches.length ? `
+        <div class="actions">
+          ${D.switches.map((s) => `
+          <div class="tg ${st(s.id) === 'on' ? 'on' : 'off'}" data-toggle="${s.id}" tabindex="0" role="button"
+            title="${s.label} : ${st(s.id) === 'on' ? 'activé' : 'désactivé'}" aria-label="${s.label}">
+            <ha-icon icon="${s.icon}"></ha-icon>
+          </div>`).join('')}
+          <div class="spacer"></div>
+        </div>` : ''}
       </ha-card>`;
   }
 
@@ -723,6 +792,27 @@ class NeakasaLitterCard extends HTMLElement {
     this._armed = true;
     this._render();
     this._armT = setTimeout(() => { this._armed = false; this._render(); }, 3000);
+  }
+
+  _onLevel() {
+    const e = this._config.entities;
+    if (!this._hass.states[e.level]) return;
+    if (this._armedLvl) {
+      clearTimeout(this._armTLvl);
+      this._armedLvl = false;
+      this._hass.callService('button', 'press', { entity_id: e.level });
+      this._render();
+      return;
+    }
+    this._armedLvl = true;
+    this._render();
+    this._armTLvl = setTimeout(() => { this._armedLvl = false; this._render(); }, 3000);
+  }
+
+  _onToggle(id) {
+    const state = this._hass.states[id];
+    if (!state) return;
+    this._hass.callService('switch', state.state === 'on' ? 'turn_off' : 'turn_on', { entity_id: id });
   }
 
   _moreInfo(entityId) {
