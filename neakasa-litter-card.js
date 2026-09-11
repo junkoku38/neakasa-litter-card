@@ -261,7 +261,12 @@ class NeakasaLitterCard extends HTMLElement {
 
   getCardSize() { return 7; }
   getGridOptions() { return { columns: 12, min_columns: 6 }; }
-  static getStubConfig() { return { room: 'Salle de bain', cat_name: 'Minou' }; }
+  static getStubConfig() { return { name: 'Litière', room: 'Salle de bain', cat_name: 'Minou' }; }
+
+  static async getConfigElement() {
+    await nkEnsureHaForm();
+    return document.createElement('neakasa-litter-card-editor');
+  }
 
   async _fetch() {
     if (!this._hass || this._fetching || !this._config.entities) return;
@@ -734,5 +739,150 @@ if (!customElements.get('neakasa-litter-card')) {
     name: 'Neakasa M1 · Litière',
     description: 'Rythme de passage, poids par chat, litière, bac à déchets et prévision du plein.',
     preview: false,
+    documentationURL: 'https://github.com/junkoku38/neakasa-litter-card',
   });
+}
+
+/* ═══════════════════════ Éditeur visuel ═══════════════════════ */
+
+const nkFireEvent = (node, type, detail = {}) => {
+  const ev = new Event(type, { bubbles: true, cancelable: false, composed: true });
+  ev.detail = detail;
+  node.dispatchEvent(ev);
+};
+
+async function nkEnsureHaForm() {
+  if (customElements.get('ha-form')) return true;
+  try {
+    const helpers = await window.loadCardHelpers();
+    const card = helpers.createCardElement({ type: 'entities', entities: [] });
+    if (card?.constructor?.getConfigElement) await card.constructor.getConfigElement();
+  } catch (err) {
+    console.warn('[neakasa-litter-card] ha-form indisponible', err);
+  }
+  return !!customElements.get('ha-form');
+}
+
+const NK_EDIT_KEYS = ['name', 'room', 'cat_name', 'cats', 'bin_capacity', 'prefix'];
+const NK_EDIT_MANAGED = [...NK_EDIT_KEYS, 'type', 'entities', 'integration'];
+const NK_EDIT_LABELS = {
+  name: 'Nom affiché',
+  room: 'Pièce',
+  cat_name: 'Chat principal',
+  cats: 'Chats (liste)',
+  bin_capacity: 'Capacité du bac (cycles)',
+  prefix: 'Préfixe des entités',
+};
+const NK_EDIT_HELPERS = {
+  cat_name: 'Chat affiché quand la litière détecte une présence sans pouvoir identifier le chat.',
+  cats: 'Optionnel. Liste explicite des chats (multi-chats), ex. « Minou, Nana ». Vide = détection automatique.',
+  bin_capacity: 'Nombre de cycles de nettoyage avant de considérer le bac plein (défaut 15).',
+  prefix: 'Préfixe des entity_id de la litière, ex. « neakasa_m1 ». Laisser vide pour utiliser celui détecté.',
+};
+
+const NK_EDIT_SCHEMA = [
+  { name: 'name', selector: { text: {} } },
+  { name: 'room', selector: { text: {} } },
+  { name: 'cat_name', selector: { text: {} } },
+  { name: 'cats', selector: { text: {} } },
+  {
+    type: 'expandable', name: '', title: 'Avancé', icon: 'mdi:tune',
+    schema: [
+      { name: 'bin_capacity', selector: { number: { min: 3, max: 60, mode: 'box', unit_of_measurement: 'cycles' } } },
+      { name: 'prefix', selector: { text: {} } },
+    ],
+  },
+];
+
+class NeakasaLitterCardEditor extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: 'open' });
+    this._config = {};
+  }
+
+  setConfig(config) {
+    this._config = config ? { ...config } : {};
+    this._render();
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    if (this._form) this._form.hass = hass;
+  }
+
+  connectedCallback() {
+    nkEnsureHaForm().then(() => this._render());
+  }
+
+  _data() {
+    const c = this._config || {};
+    const d = {};
+    NK_EDIT_KEYS.forEach((k) => {
+      if (c[k] !== undefined) d[k] = Array.isArray(c[k]) ? c[k].join(', ') : c[k];
+    });
+    return d;
+  }
+
+  _merge(v) {
+    const out = { ...this._config };
+    NK_EDIT_KEYS.forEach((k) => {
+      const val = v[k];
+      if (k === 'cats') {
+        const arr = String(val ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+        if (arr.length) out.cats = arr; else delete out.cats;
+        return;
+      }
+      if (val === '' || val === undefined || val === null) delete out[k];
+      else out[k] = val;
+    });
+    return out;
+  }
+
+  _unmanaged() {
+    return Object.keys(this._config || {}).filter((k) => !NK_EDIT_MANAGED.includes(k));
+  }
+
+  _render() {
+    if (!this.shadowRoot) return;
+    if (!customElements.get('ha-form')) {
+      this.shadowRoot.innerHTML = `<style>${NeakasaLitterCardEditor.styles}</style>
+        <div class="warn">Le composant <code>ha-form</code> n'a pas pu être chargé.
+        Utilisez l'éditeur YAML de la carte.</div>`;
+      return;
+    }
+    if (!this._form) {
+      this.shadowRoot.innerHTML = `<style>${NeakasaLitterCardEditor.styles}</style>
+        <div class="wrap"></div><div class="note"></div>`;
+      this._form = document.createElement('ha-form');
+      this._form.computeLabel = (s) => NK_EDIT_LABELS[s.name] || s.name;
+      this._form.computeHelper = (s) => NK_EDIT_HELPERS[s.name] || '';
+      this._form.addEventListener('value-changed', (ev) => {
+        ev.stopPropagation();
+        nkFireEvent(this, 'config-changed', { config: this._merge(ev.detail.value) });
+      });
+      this.shadowRoot.querySelector('.wrap').appendChild(this._form);
+    }
+    this._form.hass = this._hass;
+    this._form.schema = NK_EDIT_SCHEMA;
+    this._form.data = this._data();
+    const extra = this._unmanaged();
+    const note = this.shadowRoot.querySelector('.note');
+    if (extra.length) {
+      note.innerHTML = `<div class="keep">Conservé sans être éditable ici : <b></b>. Passez par l'éditeur YAML pour y toucher.</div>`;
+      note.querySelector('b').textContent = extra.join(', ');
+    } else note.innerHTML = '';
+  }
+}
+
+NeakasaLitterCardEditor.styles = `
+:host{display:block;}
+.warn,.keep{margin-top:12px;padding:10px 12px;border-radius:8px;font-size:12px;line-height:1.5;}
+.warn{background:var(--warning-color,#dfb37a);color:#1c1c1c;}
+.keep{background:rgba(143,176,201,.16);color:var(--primary-text-color);border:1px solid rgba(143,176,201,.4);}
+code{font-family:monospace;}
+`;
+
+if (!customElements.get('neakasa-litter-card-editor')) {
+  customElements.define('neakasa-litter-card-editor', NeakasaLitterCardEditor);
 }
