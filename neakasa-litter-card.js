@@ -23,11 +23,27 @@
  *     (entités manquantes, horodatages futurs, timers, accessibilité clavier)
  */
 
-const NK_BUSY = ['cleaning', 'leveling', 'flipover'];
+const NK_BUSY = ['cleaning', 'leveling', 'flipover', 'restoring'];
 const NK_ALERT = ['side_bin_locking_panels_missing', 'cleaning_interrupted'];
 const NK_LITTER = { sufficient: 'suffisante', moderate: 'moyenne', insufficient: 'à recharger' };
 const DAY = 86400000;
 let NK_UID = 0;
+
+/* Intégrations supportées :
+ *  - "ha-neakasa-litterbox" (roquerodrigo) : sensor.<dev>_status (idle/cleaning/restoring/
+ *    leveling/cat_appears), sensor.<chat>_weight/last_visit, sensor.<dev>_sand_level,
+ *    sensor.<dev>_visits_today, binary_sensor.<dev>_waste_bucket_full, button.<dev>_clean_now
+ *  - "hass-neakasa" : sensor.<prefix>_device_status, sensor.<prefix>_cat_<slug>, etc. */
+const nkDefaultEntities = (p, cat) => ({
+  status: `sensor.${p}_device_status`,
+  last_usage: `sensor.${p}_last_usage`,
+  stay_time: `sensor.${p}_last_stay_time`,
+  litter_level: `sensor.${p}_cat_litter_level`,
+  litter_state: `sensor.${p}_cat_litter_state`,
+  bin_state: `sensor.${p}_bin_state`,
+  cat_weight: `sensor.${p}_cat_${nkSlug(cat)}`,
+  clean: `button.${p}_clean`,
+});
 
 const nkSlug = (s) =>
   String(s).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
@@ -156,31 +172,54 @@ class NeakasaLitterCard extends HTMLElement {
       bin_capacity: 15,
       ...config,
       cat_name: cat,
-      entities: {
-        status: `sensor.${p}_device_status`,
-        last_usage: `sensor.${p}_last_usage`,
-        stay_time: `sensor.${p}_last_stay_time`,
-        litter_level: `sensor.${p}_cat_litter_level`,
-        litter_state: `sensor.${p}_cat_litter_state`,
-        bin_state: `sensor.${p}_bin_state`,
-        cat_weight: `sensor.${p}_cat_${nkSlug(cat)}`,
-        clean: `button.${p}_clean`,
-        ...(config.entities || {}),
-      },
+      integration: null, // détectée au premier set hass
+      entities: null,    // résolues à la détection
+      ...(config.integration ? { integration: config.integration } : {}),
+      ...(config.entities ? { entities: { ...nkDefaultEntities(p, cat), ...config.entities } } : {}),
     };
+    this._detected = false;
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
-    this._catsList = null;
+    this._catsList = [];
     this._history = null;
     this._sig = null;
+  }
+
+  /* Résout les entités selon l'intégration réellement présente.
+   * Priorité : config explicite > ha-neakasa-litterbox > hass-neakasa. */
+  _detect(hass) {
+    if (this._detected || this._config.entities) { this._detected = true; return; }
+    const S = hass.states;
+    const p = this._config.prefix || 'neakasa_m1';
+    const cat = this._config.cat_name;
+    if (S[`sensor.${p}_status`] || S[`button.${p}_clean_now`]) {
+      // roquerodrigo/ha-neakasa-litterbox : nom de device configurable, chats = sensor.<chat>_*
+      this._config.integration = 'litterbox';
+      this._config.entities = {
+        status: `sensor.${p}_status`,
+        last_usage: `sensor.${p}_last_visit`,
+        stay_time: null,
+        litter_level: `sensor.${p}_sand_level`,
+        litter_state: null,
+        bin_state: `binary_sensor.${p}_waste_bucket_full`,
+        clean: `button.${p}_clean_now`,
+        // visites par chat et par jour via historique des *_visits_today
+        visits_today: `sensor.${p}_visits_today`,
+      };
+    } else {
+      this._config.integration = 'legacy';
+      this._config.entities = nkDefaultEntities(p, cat);
+    }
+    this._detected = true;
   }
 
   set hass(hass) {
     this._hass = hass;
     if (!this._config) return;
-    if (!this._catsList) this._scanCats();
+    this._detect(hass);
+    if (!this._catsScanned) this._scanCats();
     const e = this._config.entities;
     const sig = [...Object.values(e), ...this._catsList.map((k) => k.id)]
-      .map((id) => hass.states[id]?.state).join('|');
+      .map((id) => id && hass.states[id]?.state).join('|');
     if (sig === this._sig) return;
     const needFetch = !this._history
       || hass.states[e.last_usage]?.state !== this._lastUsage
@@ -225,14 +264,14 @@ class NeakasaLitterCard extends HTMLElement {
   static getStubConfig() { return { room: 'Salle de bain', cat_name: 'Minou' }; }
 
   async _fetch() {
-    if (!this._hass || this._fetching) return;
+    if (!this._hass || this._fetching || !this._config.entities) return;
     this._fetching = true;
     const e = this._config.entities;
     try {
-      this._scanCats();
+      if (!this._catsScanned) this._scanCats();
       const start = new Date(nkMid(Date.now()) - 6 * DAY);
       const ids = [e.status, e.last_usage, e.bin_state, ...this._catsList.map((k) => k.id)]
-        .filter((id, i, a) => this._hass.states[id] && a.indexOf(id) === i);
+        .filter((id, i, a) => id && this._hass.states[id] && a.indexOf(id) === i);
       this._history = await this._hass.callWS({
         type: 'history/history_during_period',
         start_time: start.toISOString(),
@@ -256,24 +295,49 @@ class NeakasaLitterCard extends HTMLElement {
     const c = this._config, S = this._hass.states;
     const list = [];
     const seen = new Set();
-    const add = (name, id) => {
+    const add = (name, id, visitId) => {
       if (!id || seen.has(id) || !S[id]) return;
       seen.add(id);
-      list.push({ name: String(name), id });
+      list.push({ name: String(name), id, visitId: visitId && S[visitId] ? visitId : null });
     };
+    const slug = nkSlug(c.cat_name);
     const explicit = Array.isArray(c.cats) && c.cats.length > 0;
-    if (explicit) c.cats.forEach((n) => add(n, `sensor.${c.prefix || 'neakasa_m1'}_cat_${nkSlug(n)}`));
-    add(c.cat_name, c.entities.cat_weight);
-    if (!explicit) {
+
+    if (c.integration === 'litterbox') {
+      // roquerodrigo : sensor.<chat>_weight, sensor.<chat>_last_visit, sensor.<chat>_visits_today
+      if (explicit) {
+        c.cats.forEach((n) => add(n, `sensor.${nkSlug(n)}_weight`, `sensor.${nkSlug(n)}_last_visit`));
+      } else {
+        const re = /^sensor\.([a-z0-9_]+)_weight$/;
+        Object.keys(S).forEach((id) => {
+          const m = id.match(re);
+          if (!m) return;
+          const k = m[1];
+          if (/^litiere|litter/.test(k)) return; // exclut l'ancienne entité poids global
+          const st = S[id];
+          // ne garder que les capteurs issus de l'intégration (unité kg ou lbs)
+          if (!/^(kg|lb|lbs)$/i.test(String(st.attributes?.unit_of_measurement ?? 'kg'))) return;
+          add(nkUnslug(k), id, `sensor.${k}_last_visit`);
+        });
+        list.sort((a, b) => a.name.localeCompare(b.name, 'fr'));
+      }
+      if (!list.length) add(c.cat_name, `sensor.${slug}_weight`, `sensor.${slug}_last_visit`);
+    } else {
+      // legacy hass-neakasa : sensor.<prefix>_cat_<slug>
       const esc = String(c.prefix || 'neakasa_m1').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const re = new RegExp(`^sensor\\.${esc}_cat_([a-z0-9_]+)$`);
-      Object.keys(S).forEach((id) => {
-        const m = id.match(re);
-        if (m && !/^litter_/.test(m[1])) add(nkUnslug(m[1]), id);
-      });
-      list.sort((a, b) => a.name.localeCompare(b.name, 'fr'));
+      if (explicit) c.cats.forEach((n) => add(n, `sensor.${esc}_cat_${nkSlug(n)}`));
+      add(c.cat_name, c.entities.cat_weight);
+      if (!explicit) {
+        const re = new RegExp(`^sensor\\.${esc}_cat_([a-z0-9_]+)$`);
+        Object.keys(S).forEach((id) => {
+          const m = id.match(re);
+          if (m && !/^litter_/.test(m[1])) add(nkUnslug(m[1]), id);
+        });
+        list.sort((a, b) => a.name.localeCompare(b.name, 'fr'));
+      }
     }
     this._catsList = list;
+    this._catsScanned = true;
   }
 
   /* ───────────── Données ───────────── */
@@ -315,10 +379,16 @@ class NeakasaLitterCard extends HTMLElement {
     });
     cycles.forEach((c) => { if (c.b) lastClean = c.b; });
 
-    // Dernier vidage du bac : passage de full/missing à normal
+    // Dernier vidage du bac : legacy = passage full/missing → normal ;
+    // litterbox = binary_sensor (on → off)
     const bh = (H[e.bin_state] || []).map((x) => ({ t: ts(x), s: x.s }));
     let emptiedAt = null;
-    bh.forEach((x, i) => { if (i > 0 && x.s === 'normal' && ['full', 'missing'].includes(bh[i - 1].s)) emptiedAt = x.t; });
+    const binKind = (e.bin_state || '').startsWith('binary_sensor.') ? 'binary' : 'text';
+    if (binKind === 'binary') {
+      bh.forEach((x, i) => { if (i > 0 && x.s === 'off' && bh[i - 1].s === 'on') emptiedAt = x.t; });
+    } else {
+      bh.forEach((x, i) => { if (i > 0 && x.s === 'normal' && ['full', 'missing'].includes(bh[i - 1].s)) emptiedAt = x.t; });
+    }
     const sinceEmpty = emptiedAt ? cycles.filter((c) => c.a > emptiedAt).length : null;
 
     // Prévision du bac plein : rythme réel depuis vidage, sinon moyenne 7 j
@@ -483,17 +553,28 @@ class NeakasaLitterCard extends HTMLElement {
     const D = this._data();
     const status = st(e.status);
     const busy = NK_BUSY.includes(status);
-    const catIn = status === 'cat_present';
-    const alert = NK_ALERT.includes(status);
+    const catIn = ['cat_present', 'cat_appears'].includes(status);
+    const alert = NK_ALERT.includes(status) || st(e.bin_state) === 'on' && (e.bin_state || '').startsWith('binary_sensor.');
     const cats = D.cats;
-    const mainCat = cats.length === 1 ? cats[0].name : (cats.length ? null : c.cat_name);
+    // Chat présent : si un seul chat connu, c'est lui ; sinon on désigne celui
+    // dont le dernier passage est très récent (≤ 15 min), sinon indéterminé.
+    let mainCat = cats.length === 1 ? cats[0].name : (cats.length ? null : c.cat_name);
+    if (catIn && !mainCat && cats.length > 1) {
+      const recent = cats
+        .map((k) => [k.name, Date.parse(S[k.visitId || k.id]?.state) || 0])
+        .filter(([, t]) => t && Date.now() - t < 15 * 60000)
+        .sort((a, b) => b[1] - a[1]);
+      if (recent.length === 1) mainCat = recent[0][0];
+    }
 
     // En-tête
     const labels = {
       idle: `Prête${D.lastClean ? ` · nettoyée ${nkAgo(D.lastClean)}` : ''}`,
       cat_present: mainCat ? `${mainCat} est à l'intérieur` : 'Un chat est à l\u2019intérieur',
+      cat_appears: mainCat ? `${mainCat} est à l'intérieur` : 'Un chat est à l\u2019intérieur',
       cleaning: 'Nettoyage en cours',
       leveling: 'Nivelage de la litière',
+      restoring: 'Remise en place',
       flipover: 'Évacuation des déchets',
       paused: 'En pause',
       side_bin_locking_panels_missing: 'Panneaux latéraux absents',
@@ -504,7 +585,7 @@ class NeakasaLitterCard extends HTMLElement {
 
     // Centre du cadran
     const lastT = D.visits.length ? D.visits[D.visits.length - 1] : Date.parse(st(e.last_usage));
-    const stay = parseFloat(st(e.stay_time));
+    const stay = e.stay_time ? parseFloat(st(e.stay_time)) : NaN;
     const stayTxt = isNaN(stay) ? '' : `<br>resté ${stay >= 60 ? `${Math.floor(stay / 60)} min ${String(Math.round(stay % 60)).padStart(2, '0')}` : `${Math.round(stay)} s`}`;
     let center;
     if (catIn) {
@@ -538,11 +619,13 @@ class NeakasaLitterCard extends HTMLElement {
 
     // Consommables
     const lvl = parseFloat(st(e.litter_level));
-    const ls = st(e.litter_state), bs = st(e.bin_state);
-    const low = ls === 'insufficient';
+    const ls = e.litter_state ? st(e.litter_state) : null, bs = st(e.bin_state);
+    const binBinary = (e.bin_state || '').startsWith('binary_sensor.');
+    const binFull = binBinary ? bs === 'on' : bs === 'full';
+    const low = ls === 'insufficient' || (binBinary && !isNaN(lvl) && lvl <= 10 && !ls);
     let binTxt;
-    if (bs === 'full') binTxt = '<span style="color:var(--nk-alert)">Plein</span><small>à vider</small>';
-    else if (bs === 'missing') binTxt = '<span style="color:var(--nk-alert)">Absent</span><small>bac non détecté</small>';
+    if (binFull) binTxt = '<span style="color:var(--nk-alert)">Plein</span><small>à vider</small>';
+    else if (!binBinary && bs === 'missing') binTxt = '<span style="color:var(--nk-alert)">Absent</span><small>bac non détecté</small>';
     else {
       const cnt = D.sinceEmpty !== null
         ? `${D.sinceEmpty} cycle${D.sinceEmpty > 1 ? 's' : ''} depuis le vidage`
@@ -611,11 +694,11 @@ class NeakasaLitterCard extends HTMLElement {
           <div class="sup" data-more="${e.litter_level}" tabindex="0" role="button">
             <div class="label">Litière</div>
             <div class="art">${this._tray(lvl, low)}</div>
-            <div class="t">${isNaN(lvl) ? '—' : `${Math.round(lvl)} %`}<small style="${low ? 'color:var(--nk-alert)' : ''}">${NK_LITTER[ls] || ''}</small></div>
+            <div class="t">${isNaN(lvl) ? '—' : `${Math.round(lvl)} %`}<small style="${low ? 'color:var(--nk-alert)' : ''}">${NK_LITTER[ls] || (binBinary && low ? 'à recharger' : '')}</small></div>
           </div>
           <div class="sup" data-more="${e.bin_state}" tabindex="0" role="button">
             <div class="label">Bac à déchets</div>
-            <div class="art">${this._bin(bs, D.sinceEmpty)}</div>
+            <div class="art">${this._bin(binFull ? 'full' : binBinary ? 'normal' : bs, D.sinceEmpty)}</div>
             <div class="t">${binTxt}</div>
           </div>
         </div>
