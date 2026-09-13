@@ -630,21 +630,37 @@ class NeakasaLitterCard extends HTMLElement {
         points.push({ tv: curV, tr: isNaN(lc) ? now : lc });
       }
       points.sort((a, b) => a.tv - b.tv);
+      // historique des pesées reçues (heure de réception, valeur)
       const wHist = (H[k.id] || [])
         .map((x) => ({ t: ts(x), v: parseFloat(x.s) }))
         .filter((w) => !isNaN(w.v) && w.v > 0)
         .sort((a, b) => a.t - b.t);
       const wCur = parseFloat(S[k.id]?.state);
-      if (!isNaN(wCur) && wCur > 0) wHist.push({ t: now, v: wCur });
-      points.forEach((p) => {
+      if (!isNaN(wCur) && wCur > 0) {
+        const lw = Date.parse(S[k.id].last_updated);
+        wHist.push({ t: isNaN(lw) ? now : lw, v: wCur });
+      }
+      // association : chaque pesée reçue correspond à la DERNIÈRE visite
+      // reçue avant elle (le cloud publie le poids de la visite la plus
+      // récente, parfois avec plusieurs minutes de retard). La pesée d'une
+      // visite n'est valable que si aucune visite plus récente n'a été reçue
+      // entre la visite et la pesée.
+      const wOf = [];
+      points.forEach((p, i) => {
         if (p.tv > now) return;
         let w = null;
-        for (let j = 0; j < wHist.length; j++) {
-          if (wHist[j].t >= p.tr - 120000) { w = wHist[j].v; break; }
+        // borne : réception de la visite suivante (sinon maintenant)
+        const nextTr = i + 1 < points.length ? points[i + 1].tr : Infinity;
+        // dernière pesée reçue entre cette visite et la suivante
+        for (let j = wHist.length - 1; j >= 0; j--) {
+          if (wHist[j].t >= nextTr) continue;      // pesée d'une visite suivante
+          if (wHist[j].t < p.tr - 60000) break;      // plus ancienne que la visite → pesée d'une visite antérieure
+          w = wHist[j].v;
+          break;
         }
-        if (w === null) w = wHist.length ? wHist[wHist.length - 1].v : null;
-        catVisits.push({ cat: k.name, catId: k.id, t: p.tv, w });
+        wOf.push({ ...p, w });
       });
+      wOf.forEach((p) => catVisits.push({ cat: k.name, catId: k.id, t: p.tv, w: p.w }));
     });
 
     // A+B. appariement visites ↔ épisodes. L'horodatage cloud = heure
