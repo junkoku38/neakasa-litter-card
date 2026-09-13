@@ -539,13 +539,34 @@ class NeakasaLitterCard extends HTMLElement {
 
     const needsCleaning = e.needs_cleaning && S[e.needs_cleaning] ? S[e.needs_cleaning].state === 'on' : false;
 
-    /* Journal des passages identifiés (comme l'app officielle) :
-     * chaque changement de sensor.<chat>_last_visit = un passage du chat ;
-     * le poids affiché = dernière mesure de poids avant le passage suivant. */
+    /* Journal des passages (comme l'app officielle) — reconstruction :
+     * 1. épisodes de présence depuis sensor.<dev>_status (cat_appears → retour idle)
+     *    = heure d'ENTRÉE + durée réelle du passage ;
+     * 2. identification : le changement de sensor.<chat>_last_visit tombant
+     *    pendant ou juste après l'épisode donne le chat et son poids mesuré ;
+     * 3. épisodes sans identification = passage de chat non reconnu. */
     const logs = [];
+    const CAT_IN_STATES = ['cat_present', 'cat_appears'];
+
+    // 1. épisodes de présence
+    const episodes = [];
+    let curEp = null;
+    (H[e.status] || []).forEach((x) => {
+      const t = ts(x), s = x.s;
+      if (CAT_IN_STATES.includes(s) && !curEp) curEp = { a: t, b: null };
+      else if (!CAT_IN_STATES.includes(s) && curEp) { curEp.b = t; episodes.push(curEp); curEp = null; }
+    });
+    const curStatus = S[e.status]?.state;
+    if (curEp) { curEp.b = now; episodes.push(curEp); }
+    else if (CAT_IN_STATES.includes(curStatus)) {
+      const lc = Date.parse(S[e.status].last_changed);
+      if (!isNaN(lc)) episodes.push({ a: lc, b: now });
+    }
+
+    // 2. visites identifiées par chat (changement de last_visit + poids au plus près)
+    const catVisits = [];
     (this._catsList || []).forEach((k) => {
       if (!k.visitId) return;
-      // historique des visites : valeurs distinctes triées
       const seenT = new Set();
       const times = [];
       (H[k.visitId] || []).forEach((x) => {
@@ -553,36 +574,43 @@ class NeakasaLitterCard extends HTMLElement {
         if (!isNaN(t) && !seenT.has(t)) { seenT.add(t); times.push(t); }
       });
       const cur = Date.parse(S[k.visitId]?.state);
-      if (!isNaN(cur) && !seenT.has(cur)) { seenT.add(cur); times.push(cur); }
+      if (!isNaN(cur) && !seenT.has(cur)) times.push(cur);
       times.sort((a, b) => a - b);
-      // historique des poids (t, v) trié
       const wHist = (H[k.id] || [])
         .map((x) => ({ t: ts(x), v: parseFloat(x.s) }))
         .filter((w) => !isNaN(w.v) && w.v > 0)
         .sort((a, b) => a.t - b.t);
       const wCur = parseFloat(S[k.id]?.state);
       if (!isNaN(wCur) && wCur > 0) wHist.push({ t: now, v: wCur });
-
-      times.forEach((t, i) => {
+      times.forEach((t) => {
         if (t > now) return;
-        // poids au plus près APRÈS le passage (la mesure est prise pendant la visite)
         let w = null;
-        for (let j = 0; j < wHist.length; j++) {
-          if (wHist[j].t >= t) { w = wHist[j].v; break; }
-        }
-        // durée jusqu'au prochain changement de visite du même chat (best effort)
-        const next = times[i + 1];
-        const cycleEnd = next ?? now;
-        const stayRef = H[e.status] || [];
-        logs.push({
-          cat: k.name, catId: k.id, t,
-          w,
-          until: cycleEnd,
-        });
+        for (let j = 0; j < wHist.length; j++) { if (wHist[j].t >= t - 60000) { w = wHist[j].v; break; } }
+        catVisits.push({ cat: k.name, catId: k.id, t, w });
       });
     });
+
+    // 3. associer chaque épisode à une visite identifiée (le last_visit du chat
+    //    change à la sortie, donc pendant l'épisode ou juste après)
+    const matchedVisits = new Set();
+    episodes.forEach((ep) => {
+      // marge : l'identification arrive parfois après le retour à idle
+      const match = catVisits
+        .filter((v) => !matchedVisits.has(v) && v.t >= ep.a - 120000 && v.t <= ep.b + 600000)
+        .sort((a, b) => Math.abs(a.t - ep.b) - Math.abs(b.t - ep.b))[0];
+      if (match) {
+        matchedVisits.add(match);
+        logs.push({ cat: match.cat, catId: match.catId, t: ep.a, until: ep.b, w: match.w, dur: ep.b - ep.a });
+      } else {
+        logs.push({ cat: null, catId: null, t: ep.a, until: ep.b, w: null, dur: ep.b - ep.a });
+      }
+    });
+    // visites identifiées orphelines (épisode manquant dans le recorder) :
+    // on les garde avec l'heure d'identification
+    catVisits.forEach((v) => {
+      if (!matchedVisits.has(v)) logs.push({ cat: v.cat, catId: v.catId, t: v.t, until: null, w: v.w, dur: null });
+    });
     logs.sort((a, b) => b.t - a.t);
-    // limite : 50 derniers passages
     const logsLimited = logs.slice(0, 50);
 
     return { now, today, dayIdx, visits, perDay, prev, cycles, lastClean, emptiedAt, sinceEmpty, binEta, cats, switches, needsCleaning, logs: logsLimited };
@@ -907,31 +935,33 @@ class NeakasaLitterCard extends HTMLElement {
       }
       groups[groups.length - 1].items.push(l);
     });
-    const catsSeen = [...new Set(D.logs.map((l) => l.cat))];
-    const colorOf = (name) => catsSeen.length > 1 && name === catsSeen[1] ? 'var(--nk-ok)' : 'var(--nk-sand)';
-    const initials = (name) => name.trim().split(/\s+/).map((w) => w[0]).join('').slice(0, 2).toUpperCase();
+    const catsSeen = [...new Set(D.logs.filter((l) => l.cat).map((l) => l.cat))];
+    const colorOf = (name) => (name && catsSeen.length > 1 && name === catsSeen[1] ? 'var(--nk-ok)' : 'var(--nk-sand)');
+    const initials = (name) => name ? name.trim().split(/\s+/).map((w) => w[0]).join('').slice(0, 2).toUpperCase() : '?';
 
     const rows = groups.map((g) => `
       <div class="day">${g.label}</div>
       ${g.items.map((l) => {
         const d = new Date(l.t);
         const h = d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+        const durTxt = l.dur ? ` · ${nkSpan(l.dur)}` : '';
         return `<div class="log">
-          <div class="av" style="background:${colorOf(l.cat)}">${initials(l.cat)}</div>
-          <div class="who" data-more="${l.catId}" tabindex="0" role="button">
-            <div class="n">${l.cat}</div>
-            <div class="h">${h}</div>
+          <div class="av" style="background:${colorOf(l.cat)};${l.cat ? '' : 'background:rgba(255,255,255,.15);color:var(--nk-dim);'}">${initials(l.cat)}</div>
+          <div class="who" ${l.catId ? `data-more="${l.catId}" tabindex="0" role="button"` : ''}>
+            <div class="n">${l.cat || 'Chat non identifié'}</div>
+            <div class="h">${h}${durTxt}</div>
           </div>
           ${l.w !== null && l.w !== undefined ? `<div class="kg"><div class="v">${nkNum(l.w, 2)}</div><div class="u">kg</div></div>` : '<div class="kg"><div class="v">—</div></div>'}
         </div>`;
       }).join('')}`).join('');
 
+    const known = D.logs.filter((l) => l.cat).length;
     return `
       <div class="sheet">
         <div class="sheet-head">
           <div style="flex:1">
             <div class="t">Passages</div>
-            <div class="s">${D.logs.length} sur 7 jours${catsSeen.length > 1 ? ` · ${catsSeen.length} chats` : ''}</div>
+            <div class="s">${D.logs.length} sur 7 jours${catsSeen.length > 1 ? ` · ${catsSeen.length} chats` : ''}${known < D.logs.length ? ` · ${D.logs.length - known} non identifié${D.logs.length - known > 1 ? 's' : ''}` : ''}</div>
           </div>
           <button class="close" data-close="1" aria-label="Fermer"><ha-icon icon="mdi:close"></ha-icon></button>
         </div>
