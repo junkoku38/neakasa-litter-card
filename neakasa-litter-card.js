@@ -26,6 +26,7 @@
 const NK_BUSY = ['cleaning', 'leveling', 'flipover', 'restoring'];
 const NK_ALERT = ['side_bin_locking_panels_missing', 'cleaning_interrupted'];
 const NK_LITTER = { sufficient: 'suffisante', moderate: 'moyenne', insufficient: 'à recharger' };
+const NK_SEX_COLOR = { F: '#e29ac2', M: '#8ab8e0' }; // rose femelle, bleu mâle
 const DAY = 86400000;
 let NK_UID = 0;
 
@@ -240,6 +241,21 @@ class NeakasaLitterCard extends HTMLElement {
       ...(config.integration ? { integration: config.integration } : {}),
       ...(config.entities ? { entities: { ...nkDefaultEntities(p, cat), ...config.entities } } : {}),
     };
+    // sexe des chats : cats: [Luna] / [{name: Luna, sex: F}] / cat_sex: {Luna: F}
+    this._sexOf = {};
+    const sexOf = (name, sex) => {
+      const s = String(sex || '').trim().toUpperCase()[0];
+      if (s === 'F' || s === 'M') this._sexOf[String(name)] = s;
+    };
+    if (Array.isArray(config.cats)) {
+      config.cats.forEach((c) => {
+        if (typeof c === 'string') return;
+        if (c && c.name) sexOf(c.name, c.sex);
+      });
+    }
+    if (config.cat_sex && typeof config.cat_sex === 'object') {
+      Object.entries(config.cat_sex).forEach(([n, s]) => sexOf(n, s));
+    }
     this._detected = false;
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
     this._catsList = [];
@@ -402,7 +418,11 @@ class NeakasaLitterCard extends HTMLElement {
     if (c.integration === 'litterbox') {
       // roquerodrigo : sensor.<chat>_weight, sensor.<chat>_last_visit, sensor.<chat>_visits_today
       if (explicit) {
-        c.cats.forEach((n) => add(n, `sensor.${nkSlug(n)}_weight`, `sensor.${nkSlug(n)}_last_visit`, `sensor.${nkSlug(n)}_visits_today`));
+        c.cats.forEach((n) => {
+          const name = typeof n === 'string' ? n : n?.name;
+          if (!name) return;
+          add(name, `sensor.${nkSlug(name)}_weight`, `sensor.${nkSlug(name)}_last_visit`, `sensor.${nkSlug(name)}_visits_today`);
+        });
       } else {
         const re = /^sensor\.([a-z0-9_]+)_weight$/;
         Object.keys(S).forEach((id) => {
@@ -421,7 +441,10 @@ class NeakasaLitterCard extends HTMLElement {
     } else {
       // legacy hass-neakasa : sensor.<prefix>_cat_<slug>
       const esc = String(c.prefix || 'neakasa_m1').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      if (explicit) c.cats.forEach((n) => add(n, `sensor.${esc}_cat_${nkSlug(n)}`));
+      if (explicit) c.cats.forEach((n) => {
+        const name = typeof n === 'string' ? n : n?.name;
+        if (name) add(name, `sensor.${esc}_cat_${nkSlug(name)}`);
+      });
       add(c.cat_name, c.entities.cat_weight);
       if (!explicit) {
         const re = new RegExp(`^sensor\\.${esc}_cat_([a-z0-9_]+)$`);
@@ -780,10 +803,20 @@ class NeakasaLitterCard extends HTMLElement {
     const [sx, sy] = at(-Math.PI / 2, R0), [ex, ey] = at(an, R0);
     const large = an + Math.PI / 2 > Math.PI ? 1 : 0;
     g += `<path d="M${sx},${sy} A${R0},${R0} 0 ${large} 1 ${ex},${ey}" fill="none" stroke="rgba(255,255,255,.17)" stroke-width="2" stroke-linecap="round"/>`;
+    // couleur par chat : priorité au sexe (F rose / M bleu), secours sable
+    const colorFor = (t) => {
+      const l = (D.logs || []).find((x) => Math.abs(x.t - t) < 60000);
+      if (l?.cat) {
+        const s = this._sexOf?.[l.cat];
+        if (s && NK_SEX_COLOR[s]) return NK_SEX_COLOR[s];
+        return 'var(--nk-sand)';
+      }
+      return 'var(--nk-sand)';
+    };
     D.visits.forEach((t) => {
       const i = D.dayIdx(t);
       const [x, y] = at(ang(t), R0 - i * ST);
-      g += `<circle cx="${x}" cy="${y}" r="${i ? 2.3 : 3.4}" fill="var(--nk-sand)" opacity="${i ? (0.62 - i * 0.07).toFixed(2) : 1}"/>`;
+      g += `<circle cx="${x}" cy="${y}" r="${i ? 2.3 : 3.4}" fill="${colorFor(t)}" opacity="${i ? (0.62 - i * 0.07).toFixed(2) : 1}"/>`;
     });
     g += `<circle cx="${ex}" cy="${ey}" r="3" fill="#f4f3ef" style="filter:drop-shadow(0 0 4px rgba(255,255,255,.7))"/>`;
     if (busy) {
@@ -1078,7 +1111,12 @@ class NeakasaLitterCard extends HTMLElement {
       groups[groups.length - 1].items.push(l);
     });
     const catsSeen = [...new Set(D.logs.filter((l) => l.cat).map((l) => l.cat))];
-    const colorOf = (name) => (name && catsSeen.length > 1 && name === catsSeen[1] ? 'var(--nk-ok)' : 'var(--nk-sand)');
+    // couleur d'avatar : sexe prioritaire (F rose / M bleu), sinon sable/vert par chat
+    const colorOf = (name) => {
+      const s = name && this._sexOf?.[name];
+      if (s && NK_SEX_COLOR[s]) return NK_SEX_COLOR[s];
+      return (name && catsSeen.length > 1 && name === catsSeen[1] ? 'var(--nk-ok)' : 'var(--nk-sand)');
+    };
     const initials = (name) => name ? name.trim().split(/\s+/).map((w) => w[0]).join('').slice(0, 2).toUpperCase() : '?';
 
     const rows = groups.map((g) => `
@@ -1185,19 +1223,21 @@ async function nkEnsureHaForm() {
   return !!customElements.get('ha-form');
 }
 
-const NK_EDIT_KEYS = ['name', 'room', 'cat_name', 'cats', 'bin_capacity', 'prefix'];
+const NK_EDIT_KEYS = ['name', 'room', 'cat_name', 'cats', 'cat_sex', 'bin_capacity', 'prefix'];
 const NK_EDIT_MANAGED = [...NK_EDIT_KEYS, 'type', 'entities', 'integration'];
 const NK_EDIT_LABELS = {
   name: 'Nom affiché',
   room: 'Pièce',
   cat_name: 'Chat principal',
   cats: 'Chats (liste)',
+  cat_sex: 'Sexe des chats (F/M)',
   bin_capacity: 'Capacité du bac (cycles)',
   prefix: 'Préfixe des entités',
 };
 const NK_EDIT_HELPERS = {
   cat_name: 'Chat affiché quand la litière détecte une présence sans pouvoir identifier le chat.',
   cats: 'Optionnel. Liste explicite des chats (multi-chats), ex. « Minou, Nana ». Vide = détection automatique.',
+  cat_sex: 'Sexe par chat pour les couleurs du cadran et du journal : « Luna=F, Minou=M ». F = rose, M = bleu.',
   bin_capacity: 'Nombre de cycles de nettoyage avant de considérer le bac plein (défaut 15).',
   prefix: 'Préfixe des entity_id de la litière, ex. « neakasa_m1 ». Laisser vide pour utiliser celui détecté.',
 };
@@ -1207,6 +1247,7 @@ const NK_EDIT_SCHEMA = [
   { name: 'room', selector: { text: {} } },
   { name: 'cat_name', selector: { text: {} } },
   { name: 'cats', selector: { text: {} } },
+  { name: 'cat_sex', selector: { text: {} } },
   {
     type: 'expandable', name: '', title: 'Avancé', icon: 'mdi:tune',
     schema: [
@@ -1241,6 +1282,13 @@ class NeakasaLitterCardEditor extends HTMLElement {
     const c = this._config || {};
     const d = {};
     NK_EDIT_KEYS.forEach((k) => {
+      if (k === 'cat_sex') {
+        if (c.cat_sex && typeof c.cat_sex === 'object') {
+          const s = Object.entries(c.cat_sex).map(([n, v]) => `${n}=${v}`).join(', ');
+          if (s) d.cat_sex = s;
+        }
+        return;
+      }
       if (c[k] !== undefined) d[k] = Array.isArray(c[k]) ? c[k].join(', ') : c[k];
     });
     return d;
@@ -1253,6 +1301,16 @@ class NeakasaLitterCardEditor extends HTMLElement {
       if (k === 'cats') {
         const arr = String(val ?? '').split(',').map((s) => s.trim()).filter(Boolean);
         if (arr.length) out.cats = arr; else delete out.cats;
+        return;
+      }
+      if (k === 'cat_sex') {
+        const obj = {};
+        String(val ?? '').split(',').forEach((p) => {
+          const m = p.split('=').map((s) => s.trim());
+          const s = String(m[1] || '').toUpperCase()[0];
+          if (m[0] && (s === 'F' || s === 'M')) obj[m[0]] = s;
+        });
+        if (Object.keys(obj).length) out.cat_sex = obj; else delete out.cat_sex;
         return;
       }
       if (val === '' || val === undefined || val === null) delete out[k];
