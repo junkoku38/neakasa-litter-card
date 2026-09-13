@@ -460,6 +460,23 @@ class NeakasaLitterCard extends HTMLElement {
 
     const perDay = Array(7).fill(0);
     visits.forEach((t) => { perDay[dayIdx(t)] += 1; });
+
+    // Compteur officiel du jour : le cloud compte TOUTES les visites, y
+    // compris celles perdues entre deux polls. Prioritaire pour aujourd'hui
+    // et pour l'histogramme (max de chaque jour depuis l'historique).
+    const vTodayId = e.visits_today;
+    if (vTodayId && S[vTodayId]) {
+      const cur = parseInt(S[vTodayId].state, 10);
+      if (!isNaN(cur)) perDay[0] = cur;
+      // jours précédents : valeur max du compteur observée ce jour-là
+      const byDay = {};
+      (H[vTodayId] || []).forEach((x) => {
+        const n = parseInt(x.s, 10);
+        const d = dayIdx(ts(x));
+        if (!isNaN(n) && d >= 0 && d <= 6 && n > (byDay[d] ?? 0)) byDay[d] = n;
+      });
+      Object.keys(byDay).forEach((d) => { if (+d > 0) perDay[+d] = byDay[+d]; });
+    }
     const prev = perDay.slice(1).filter((n) => n > 0);
 
     // Cycles de nettoyage (états « busy » fusionnés)
@@ -1086,7 +1103,7 @@ class NeakasaLitterCard extends HTMLElement {
         <div class="sheet-head">
           <div style="flex:1">
             <div class="t">Passages</div>
-            <div class="s">${D.logs.length} sur 7 jours${catsSeen.length > 1 ? ` · ${catsSeen.length} chats` : ''}${known < D.logs.length ? ` · ${D.logs.length - known} non identifié${D.logs.length - known > 1 ? 's' : ''}` : ''}</div>
+            <div class="s">${D.logs.length} passage${D.logs.length > 1 ? 's' : ''} détaillé${D.logs.length > 1 ? 's' : ''}${catsSeen.length > 1 ? ` · ${catsSeen.length} chats` : ''}${known < D.logs.length ? ` · ${D.logs.length - known} non identifié${D.logs.length - known > 1 ? 's' : ''}` : ''}</div>
           </div>
           <button class="close" data-close="1" aria-label="Fermer"><ha-icon icon="mdi:close"></ha-icon></button>
         </div>
