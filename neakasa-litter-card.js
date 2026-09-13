@@ -785,39 +785,60 @@ class NeakasaLitterCard extends HTMLElement {
       logs.push({ cat: p.k.name, catId: p.k.id, t: ep.a, dur: ep.b - ep.a, w: null, inferred: true });
     });
 
-    // D. épisodes restants : uniquement s'ils correspondent à de VRAIES visites.
-    // Le capteur cat_appears se déclenche aussi pour les présences trop
-    // courtes pour être pesées (chat à moitié entré, tête seule) — l'app
-    // officielle ne les compte pas : le compteur global du jour (cloud) fait
-    // foi. Un épisode restant n'est un passage que si le compte reconstruit
-    // (connues + déduites) est encore INFÉRIEUR au compteur officiel du jour,
-    // et si la présence a duré assez pour être pesée (≥ 20 s).
-    const officialDay = {}; // dayIdx -> compteur officiel max du jour
-    if (e.visits_today && H[e.visits_today]) {
-      (H[e.visits_today] || []).forEach((x) => {
-        const n = parseInt(x.s, 10);
-        const d = dayIdx(ts(x));
-        if (!isNaN(n) && d >= 0 && d <= 6 && n > (officialDay[d] ?? 0)) officialDay[d] = n;
-      });
-      const cur = parseInt(S[e.visits_today]?.state, 10);
-      if (!isNaN(cur)) officialDay[0] = Math.max(officialDay[0] ?? 0, cur);
-    }
-    const rebuiltDay = {}; // dayIdx -> passages déjà reconstruits
-    logs.forEach((l) => {
-      const d = dayIdx(l.t);
-      if (d >= 0 && d <= 6) rebuiltDay[d] = (rebuiltDay[d] || 0) + 1;
-    });
-    [...epFree].forEach((i) => {
-      const ep = episodes[i];
-      if ((ep.b - ep.a) < 20000) return; // trop court pour être pesé
-      const d = dayIdx(ep.a);
-      if (d >= 0 && d <= 6) {
-        const official = officialDay[d] ?? Infinity; // sans compteur : on garde l'épisode
-        if (rebuiltDay[d] !== undefined && rebuiltDay[d] >= official) return; // déjà complet
-        rebuiltDay[d] = (rebuiltDay[d] || 0) + 1;
+    // D. épisodes restants : uniquement ceux qui tombent dans une fenêtre où
+    // un COMPTEUR du cloud a réellement progressé. Le capteur cat_appears se
+    // déclenche aussi pour des présences jamais comptées (tête seule, demi-
+    // entrée) — même de 3 min, tandis que le cloud peut compter une visite de
+    // 17 s : la durée n'est PAS le critère. Seuls les incréments des compteurs
+    // (global et par chat) entre deux réceptions font foi :
+    //   fenêtre [poll N-1, poll N] : incrément = compteur(N) − compteur(N-1)
+    // moins les visites déjà reconstruites dans cette fenêtre ; s'il reste
+    // un incrément non expliqué, l'épisode libre le plus proche est une
+    // vraie visite.
+    const counterWindows = []; // { t0, t1, extra } — extra = visites non expliquées
+    const buildWindows = (id, stateId) => {
+      if (!id || !(H[id] || S[stateId])) return;
+      const pts = (H[id] || []).map((x) => ({ t: ts(x), n: parseInt(x.s, 10) })).filter((p) => !isNaN(p.n));
+      if (S[stateId]) {
+        const cur = parseInt(S[stateId].state, 10);
+        if (!isNaN(cur)) {
+          const lu = Date.parse(S[stateId].last_updated);
+          pts.push({ t: isNaN(lu) ? now : lu, n: cur });
+        }
       }
-      logs.push({ cat: null, catId: null, t: ep.a, dur: ep.b - ep.a, w: null, inferred: false });
+      pts.sort((a, b) => a.t - b.t);
+      for (let i = 1; i < pts.length; i++) {
+        const inc = pts[i].n - pts[i - 1].n;
+        if (inc <= 0) continue; // reset quotidien ou pas de progression
+        // heure du jour : la fenêtre doit être dans les 7 jours affichés
+        const d0 = dayIdx(pts[i - 1].t);
+        if (d0 < 0 || d0 > 6) continue;
+        counterWindows.push({ t0: pts[i - 1].t, t1: pts[i].t, extra: inc });
+      }
+    };
+    (this._catsList || []).forEach((k) => buildWindows(k.visitsId, k.visitsId));
+    buildWindows(e.visits_today, e.visits_today);
+
+    // soustraire les passages déjà reconstruits de chaque fenêtre
+    const inWindow = (t, w) => t > w.t0 && t <= w.t1;
+    counterWindows.forEach((w) => {
+      logs.forEach((l) => { if (inWindow(l.t, w)) w.extra -= 1; });
     });
+
+    // épisodes libres par fenêtre : les plus proches du bord droit (poll)
+    // d'abord — les visites d'un lot précèdent sa réception
+    [...epFree]
+      .map((i) => i)
+      .sort((a, b) => episodes[b].a - episodes[a].a)
+      .forEach((i) => {
+        const ep = episodes[i];
+        // fenêtre non épuisée contenant l'épisode (début OU fin de l'épisode)
+        const w = counterWindows.find((x) => x.extra > 0 && (inWindow(ep.a, x) || inWindow(ep.b, x) || (ep.a <= x.t0 && ep.b >= x.t1)));
+        if (!w) return;
+        w.extra -= 1;
+        epFree.delete(i);
+        logs.push({ cat: null, catId: null, t: ep.a, dur: ep.b - ep.a, w: null, inferred: false });
+      });
 
     logs.sort((a, b) => b.t - a.t);
     const logsLimited = logs.slice(0, 120); // journal ET cadran partagent cette source
