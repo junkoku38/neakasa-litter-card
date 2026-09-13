@@ -785,9 +785,37 @@ class NeakasaLitterCard extends HTMLElement {
       logs.push({ cat: p.k.name, catId: p.k.id, t: ep.a, dur: ep.b - ep.a, w: null, inferred: true });
     });
 
+    // D. épisodes restants : uniquement s'ils correspondent à de VRAIES visites.
+    // Le capteur cat_appears se déclenche aussi pour les présences trop
+    // courtes pour être pesées (chat à moitié entré, tête seule) — l'app
+    // officielle ne les compte pas : le compteur global du jour (cloud) fait
+    // foi. Un épisode restant n'est un passage que si le compte reconstruit
+    // (connues + déduites) est encore INFÉRIEUR au compteur officiel du jour,
+    // et si la présence a duré assez pour être pesée (≥ 20 s).
+    const officialDay = {}; // dayIdx -> compteur officiel max du jour
+    if (e.visits_today && H[e.visits_today]) {
+      (H[e.visits_today] || []).forEach((x) => {
+        const n = parseInt(x.s, 10);
+        const d = dayIdx(ts(x));
+        if (!isNaN(n) && d >= 0 && d <= 6 && n > (officialDay[d] ?? 0)) officialDay[d] = n;
+      });
+      const cur = parseInt(S[e.visits_today]?.state, 10);
+      if (!isNaN(cur)) officialDay[0] = Math.max(officialDay[0] ?? 0, cur);
+    }
+    const rebuiltDay = {}; // dayIdx -> passages déjà reconstruits
+    logs.forEach((l) => {
+      const d = dayIdx(l.t);
+      if (d >= 0 && d <= 6) rebuiltDay[d] = (rebuiltDay[d] || 0) + 1;
+    });
     [...epFree].forEach((i) => {
       const ep = episodes[i];
-      if ((ep.b - ep.a) < 5000) return; // micro-présence ignorée
+      if ((ep.b - ep.a) < 20000) return; // trop court pour être pesé
+      const d = dayIdx(ep.a);
+      if (d >= 0 && d <= 6) {
+        const official = officialDay[d] ?? Infinity; // sans compteur : on garde l'épisode
+        if (rebuiltDay[d] !== undefined && rebuiltDay[d] >= official) return; // déjà complet
+        rebuiltDay[d] = (rebuiltDay[d] || 0) + 1;
+      }
       logs.push({ cat: null, catId: null, t: ep.a, dur: ep.b - ep.a, w: null, inferred: false });
     });
 
