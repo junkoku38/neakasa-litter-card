@@ -147,6 +147,49 @@ const NK_CSS = `
   .tg.on { color: var(--nk-sand); background: rgba(200,185,142,.14); }
   .tg.off { color: var(--nk-faint); }
 
+  .sheet {
+    position: absolute; inset: 0; z-index: 5; border-radius: 24px; overflow: hidden;
+    background: linear-gradient(180deg, #22252b 0%, #17191d 100%);
+    display: flex; flex-direction: column;
+    opacity: 0; animation: nk-sheet-in .25s ease forwards;
+  }
+  @keyframes nk-sheet-in { to { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .sheet { animation: none; opacity: 1; } }
+  .sheet-head {
+    display: flex; align-items: center; gap: 10px; padding: 16px 18px 12px;
+    border-bottom: 1px solid var(--nk-line); flex: none;
+  }
+  .sheet-head .t { flex: 1; font-size: 16px; font-weight: 600; color: #f4f3ef; }
+  .sheet-head .s { font-size: 12px; color: var(--nk-dim); margin-top: 2px; }
+  .close {
+    flex: none; width: 36px; height: 36px; border-radius: 50%; border: none; cursor: pointer;
+    display: grid; place-items: center; background: rgba(255,255,255,.08); color: #f1efe9; --mdc-icon-size: 18px;
+  }
+  .close:hover { background: rgba(255,255,255,.14); }
+  .close:focus-visible { outline: 2px solid var(--nk-sand); outline-offset: 2px; }
+  .logs { flex: 1; overflow-y: auto; padding: 6px 18px 18px; }
+  .logs::-webkit-scrollbar { width: 4px; }
+  .logs::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); border-radius: 2px; }
+  .day { font-size: 11px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; color: var(--nk-faint); margin: 16px 0 6px; }
+  .log {
+    display: flex; align-items: center; gap: 12px; padding: 9px 0; min-width: 0;
+    border-bottom: 1px solid rgba(255,255,255,.03);
+  }
+  .log .av {
+    flex: none; width: 38px; height: 38px; border-radius: 50%; display: grid; place-items: center;
+    --mdc-icon-size: 19px; color: #1b1c1f; font-size: 15px; font-weight: 700;
+    background: var(--nk-sand);
+  }
+  .log .av.alt { background: var(--nk-ok); }
+  .log .who { flex: 1; min-width: 0; }
+  .log .who .n { font-size: 14px; color: var(--nk-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .log .who .h { font-size: 12px; color: var(--nk-dim); margin-top: 1px; }
+  .log .kg { flex: none; text-align: right; }
+  .log .kg .v { font-size: 15px; color: #f3f2ee; font-weight: 500; }
+  .log .kg .u { font-size: 11px; color: var(--nk-faint); }
+  .log .dur { flex: none; font-size: 11px; color: var(--nk-faint); min-width: 40px; text-align: right; }
+  .empty { padding: 40px 0; text-align: center; color: var(--nk-faint); font-size: 13px; }
+
   .week { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--nk-line); }
   .wk { display: flex; flex-direction: column; align-items: center; gap: 5px; min-width: 0; }
   .wk .n { font-size: 11px; color: var(--nk-dim); height: 14px; line-height: 14px; }
@@ -176,8 +219,11 @@ class NeakasaLitterCard extends HTMLElement {
     this._uid = `nk${++NK_UID}`;
     this._armed = false;
     this._armT = null;
+    this._armedLvl = false;
+    this._armTLvl = null;
     this._connected = false;
     this._fetching = false;
+    this._showLogs = false;
   }
 
   setConfig(config) {
@@ -261,6 +307,8 @@ class NeakasaLitterCard extends HTMLElement {
     this._connected = true;
     const root = this.shadowRoot;
     root.addEventListener('click', (ev) => {
+      if (ev.target.closest('[data-close]')) { this._showLogs = false; this._render(); return; }
+      if (ev.target.closest('[data-logs]')) { this._showLogs = true; this._render(); return; }
       const btn = ev.target.closest('.btn');
       if (btn) {
         if (btn.dataset.act === 'level') this._onLevel();
@@ -273,7 +321,10 @@ class NeakasaLitterCard extends HTMLElement {
       if (t) this._moreInfo(t.dataset.more);
     });
     root.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape' && this._showLogs) { this._showLogs = false; this._render(); return; }
       if (ev.key !== 'Enter' && ev.key !== ' ') return;
+      if (ev.target.closest?.('[data-close]')) { ev.preventDefault(); this._showLogs = false; this._render(); return; }
+      if (ev.target.closest?.('[data-logs]')) { ev.preventDefault(); this._showLogs = true; this._render(); return; }
       const tg = ev.target.closest?.('[data-toggle]');
       if (tg) { ev.preventDefault(); this._onToggle(tg.dataset.toggle); return; }
       const t = ev.target.closest?.('[data-more]');
@@ -307,8 +358,11 @@ class NeakasaLitterCard extends HTMLElement {
     try {
       if (!this._catsScanned) this._scanCats();
       const start = new Date(nkMid(Date.now()) - 6 * DAY);
-      const ids = [e.status, e.last_usage, e.bin_state, ...this._catsList.map((k) => k.id)]
-        .filter((id, i, a) => id && this._hass.states[id] && a.indexOf(id) === i);
+      const ids = [
+        e.status, e.last_usage, e.bin_state,
+        ...this._catsList.map((k) => k.id),
+        ...this._catsList.map((k) => k.visitId).filter(Boolean),
+      ].filter((id, i, a) => id && this._hass.states[id] && a.indexOf(id) === i);
       this._history = await this._hass.callWS({
         type: 'history/history_during_period',
         start_time: start.toISOString(),
@@ -485,7 +539,53 @@ class NeakasaLitterCard extends HTMLElement {
 
     const needsCleaning = e.needs_cleaning && S[e.needs_cleaning] ? S[e.needs_cleaning].state === 'on' : false;
 
-    return { now, today, dayIdx, visits, perDay, prev, cycles, lastClean, emptiedAt, sinceEmpty, binEta, cats, switches, needsCleaning };
+    /* Journal des passages identifiés (comme l'app officielle) :
+     * chaque changement de sensor.<chat>_last_visit = un passage du chat ;
+     * le poids affiché = dernière mesure de poids avant le passage suivant. */
+    const logs = [];
+    (this._catsList || []).forEach((k) => {
+      if (!k.visitId) return;
+      // historique des visites : valeurs distinctes triées
+      const seenT = new Set();
+      const times = [];
+      (H[k.visitId] || []).forEach((x) => {
+        const t = Date.parse(x.s);
+        if (!isNaN(t) && !seenT.has(t)) { seenT.add(t); times.push(t); }
+      });
+      const cur = Date.parse(S[k.visitId]?.state);
+      if (!isNaN(cur) && !seenT.has(cur)) { seenT.add(cur); times.push(cur); }
+      times.sort((a, b) => a - b);
+      // historique des poids (t, v) trié
+      const wHist = (H[k.id] || [])
+        .map((x) => ({ t: ts(x), v: parseFloat(x.s) }))
+        .filter((w) => !isNaN(w.v) && w.v > 0)
+        .sort((a, b) => a.t - b.t);
+      const wCur = parseFloat(S[k.id]?.state);
+      if (!isNaN(wCur) && wCur > 0) wHist.push({ t: now, v: wCur });
+
+      times.forEach((t, i) => {
+        if (t > now) return;
+        // poids au plus près APRÈS le passage (la mesure est prise pendant la visite)
+        let w = null;
+        for (let j = 0; j < wHist.length; j++) {
+          if (wHist[j].t >= t) { w = wHist[j].v; break; }
+        }
+        // durée jusqu'au prochain changement de visite du même chat (best effort)
+        const next = times[i + 1];
+        const cycleEnd = next ?? now;
+        const stayRef = H[e.status] || [];
+        logs.push({
+          cat: k.name, catId: k.id, t,
+          w,
+          until: cycleEnd,
+        });
+      });
+    });
+    logs.sort((a, b) => b.t - a.t);
+    // limite : 50 derniers passages
+    const logsLimited = logs.slice(0, 50);
+
+    return { now, today, dayIdx, visits, perDay, prev, cycles, lastClean, emptiedAt, sinceEmpty, binEta, cats, switches, needsCleaning, logs: logsLimited };
   }
 
   /* ───────────── Cadran 24 h × 7 jours ───────────── */
@@ -707,6 +807,7 @@ class NeakasaLitterCard extends HTMLElement {
     const armedLvl = this._armedLvl && !catIn && !busy;
     const canLevel = !!(e.level && S[e.level]);
     const canClean = !!(e.clean && S[e.clean]);
+    const hasLogs = D.logs.length > 0;
 
     this.shadowRoot.innerHTML = `
       <style>${NK_CSS}</style>
@@ -775,8 +876,67 @@ class NeakasaLitterCard extends HTMLElement {
             <ha-icon icon="${s.icon}"></ha-icon>
           </div>`).join('')}
           <div class="spacer"></div>
+          ${hasLogs ? `
+          <div class="tg" data-logs="1" tabindex="0" role="button" title="Journal des passages" aria-label="Journal des passages">
+            <ha-icon icon="mdi:clipboard-text-clock"></ha-icon>
+          </div>` : ''}
+        </div>` : hasLogs ? `
+        <div class="actions">
+          <div class="spacer"></div>
+          <div class="tg" data-logs="1" tabindex="0" role="button" title="Journal des passages" aria-label="Journal des passages">
+            <ha-icon icon="mdi:clipboard-text-clock"></ha-icon>
+          </div>
         </div>` : ''}
+
+        ${this._showLogs ? this._logsSheet(D) : ''}
       </ha-card>`;
+  }
+
+  /* ───────────── Journal des passages (sheet plein écran carte) ───────────── */
+  _logsSheet(D) {
+    const e = this._config.entities;
+    // regrouper par jour (fr), plus récent en tête
+    const groups = [];
+    let curDay = null;
+    D.logs.forEach((l) => {
+      const d = new Date(l.t);
+      const key = nkMid(l.t);
+      if (key !== curDay) {
+        curDay = key;
+        groups.push({ key, label: d.toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' }), items: [] });
+      }
+      groups[groups.length - 1].items.push(l);
+    });
+    const catsSeen = [...new Set(D.logs.map((l) => l.cat))];
+    const colorOf = (name) => catsSeen.length > 1 && name === catsSeen[1] ? 'var(--nk-ok)' : 'var(--nk-sand)';
+    const initials = (name) => name.trim().split(/\s+/).map((w) => w[0]).join('').slice(0, 2).toUpperCase();
+
+    const rows = groups.map((g) => `
+      <div class="day">${g.label}</div>
+      ${g.items.map((l) => {
+        const d = new Date(l.t);
+        const h = d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+        return `<div class="log">
+          <div class="av" style="background:${colorOf(l.cat)}">${initials(l.cat)}</div>
+          <div class="who" data-more="${l.catId}" tabindex="0" role="button">
+            <div class="n">${l.cat}</div>
+            <div class="h">${h}</div>
+          </div>
+          ${l.w !== null && l.w !== undefined ? `<div class="kg"><div class="v">${nkNum(l.w, 2)}</div><div class="u">kg</div></div>` : '<div class="kg"><div class="v">—</div></div>'}
+        </div>`;
+      }).join('')}`).join('');
+
+    return `
+      <div class="sheet">
+        <div class="sheet-head">
+          <div style="flex:1">
+            <div class="t">Passages</div>
+            <div class="s">${D.logs.length} sur 7 jours${catsSeen.length > 1 ? ` · ${catsSeen.length} chats` : ''}</div>
+          </div>
+          <button class="close" data-close="1" aria-label="Fermer"><ha-icon icon="mdi:close"></ha-icon></button>
+        </div>
+        <div class="logs">${rows || '<div class="empty">Aucun passage enregistré</div>'}</div>
+      </div>`;
   }
 
   _onClean() {
