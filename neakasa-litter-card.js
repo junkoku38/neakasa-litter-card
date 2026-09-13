@@ -375,7 +375,7 @@ class NeakasaLitterCard extends HTMLElement {
       if (!this._catsScanned) this._scanCats();
       const start = new Date(nkMid(Date.now()) - 6 * DAY);
       const ids = [
-        e.status, e.last_usage, e.bin_state,
+        e.status, e.last_usage, e.bin_state, e.visits_today,
         ...this._catsList.map((k) => k.id),
         ...this._catsList.map((k) => k.visitId).filter(Boolean),
         ...this._catsList.map((k) => k.visitsId).filter(Boolean),
@@ -792,7 +792,7 @@ class NeakasaLitterCard extends HTMLElement {
     });
 
     logs.sort((a, b) => b.t - a.t);
-    const logsLimited = logs.slice(0, 50);
+    const logsLimited = logs.slice(0, 120); // journal ET cadran partagent cette source
 
     return { now, today, dayIdx, visits, perDay, prev, cycles, lastClean, emptiedAt, sinceEmpty, binEta, cats, switches, needsCleaning, logs: logsLimited };
   }
@@ -819,20 +819,19 @@ class NeakasaLitterCard extends HTMLElement {
     const [sx, sy] = at(-Math.PI / 2, R0), [ex, ey] = at(an, R0);
     const large = an + Math.PI / 2 > Math.PI ? 1 : 0;
     g += `<path d="M${sx},${sy} A${R0},${R0} 0 ${large} 1 ${ex},${ey}" fill="none" stroke="rgba(255,255,255,.17)" stroke-width="2" stroke-linecap="round"/>`;
-    // couleur par chat : priorité au sexe (F rose / M bleu), secours sable
-    const colorFor = (t) => {
-      const l = (D.logs || []).find((x) => Math.abs(x.t - t) < 60000);
-      if (l?.cat) {
-        const s = this._sexOf?.[l.cat];
-        if (s && NK_SEX_COLOR[s]) return NK_SEX_COLOR[s];
-        return 'var(--nk-sand)';
-      }
-      return 'var(--nk-sand)';
+    // couleur par chat : priorité au sexe (F rose / M bleu), secours sable.
+    // Les points du cadran = TOUS les passages reconstruits (journal), pas
+    // seulement les pesées reçues — même compte que le journal.
+    const colorOfLog = (l) => {
+      if (!l.cat) return 'var(--nk-sand)';
+      const s = this._sexOf?.[l.cat];
+      return (s && NK_SEX_COLOR[s]) || 'var(--nk-sand)';
     };
-    D.visits.forEach((t) => {
-      const i = D.dayIdx(t);
-      const [x, y] = at(ang(t), R0 - i * ST);
-      g += `<circle cx="${x}" cy="${y}" r="${i ? 2.3 : 3.4}" fill="${colorFor(t)}" opacity="${i ? (0.62 - i * 0.07).toFixed(2) : 1}"/>`;
+    (D.logs || []).forEach((l) => {
+      const i = D.dayIdx(l.t);
+      if (i < 0 || i > 6) return;
+      const [x, y] = at(ang(l.t), R0 - i * ST);
+      g += `<circle cx="${x}" cy="${y}" r="${i ? 2.3 : 3.4}" fill="${colorOfLog(l)}" opacity="${i ? (0.62 - i * 0.07).toFixed(2) : 1}"/>`;
     });
     g += `<circle cx="${ex}" cy="${ey}" r="3" fill="#f4f3ef" style="filter:drop-shadow(0 0 4px rgba(255,255,255,.7))"/>`;
     if (busy) {
@@ -956,7 +955,7 @@ class NeakasaLitterCard extends HTMLElement {
     const subCls = alert ? 'alert' : (catIn || busy) ? 'acc' : '';
 
     // Centre du cadran
-    const lastT = D.visits.length ? D.visits[D.visits.length - 1] : Date.parse(st(e.last_usage));
+    const lastT = D.logs.length ? D.logs.map((l) => l.t).sort((a, b) => a - b).pop() : Date.parse(st(e.last_usage));
     const stay = e.stay_time ? parseFloat(st(e.stay_time)) : NaN;
     const stayTxt = isNaN(stay) ? '' : `<br>resté ${stay >= 60 ? `${Math.floor(stay / 60)} min ${String(Math.round(stay % 60)).padStart(2, '0')}` : `${Math.round(stay)} s`}`;
     let center;
