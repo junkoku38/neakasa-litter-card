@@ -563,52 +563,75 @@ class NeakasaLitterCard extends HTMLElement {
       if (!isNaN(lc)) episodes.push({ a: lc, b: now });
     }
 
-    // 2. visites identifiées par chat (changement de last_visit + poids au plus près)
+    // 2. visites identifiées par chat : la VALEUR de last_visit = heure réelle
+    //    de la visite ; la réception (lu) sert à apparier le poids publié
+    //    dans le même lot du cloud.
     const catVisits = [];
     (this._catsList || []).forEach((k) => {
       if (!k.visitId) return;
+      // points de réception : chaque changement de last_visit (t_visite, t_reception)
       const seenT = new Set();
-      const times = [];
+      const points = [];
       (H[k.visitId] || []).forEach((x) => {
-        const t = Date.parse(x.s);
-        if (!isNaN(t) && !seenT.has(t)) { seenT.add(t); times.push(t); }
+        const tv = Date.parse(x.s);
+        if (!isNaN(tv) && !seenT.has(tv)) { seenT.add(tv); points.push({ tv, tr: ts(x) }); }
       });
-      const cur = Date.parse(S[k.visitId]?.state);
-      if (!isNaN(cur) && !seenT.has(cur)) times.push(cur);
-      times.sort((a, b) => a - b);
+      const curV = Date.parse(S[k.visitId]?.state);
+      if (!isNaN(curV) && !seenT.has(curV)) {
+        const lc = Date.parse(S[k.visitId].last_updated);
+        points.push({ tv: curV, tr: isNaN(lc) ? now : lc });
+      }
+      points.sort((a, b) => a.tv - b.tv);
+      // poids : chaque mesure est publiée à la réception d'une visite ;
+      // le poids courant correspond à la dernière visite reçue
       const wHist = (H[k.id] || [])
         .map((x) => ({ t: ts(x), v: parseFloat(x.s) }))
         .filter((w) => !isNaN(w.v) && w.v > 0)
         .sort((a, b) => a.t - b.t);
       const wCur = parseFloat(S[k.id]?.state);
       if (!isNaN(wCur) && wCur > 0) wHist.push({ t: now, v: wCur });
-      times.forEach((t) => {
-        if (t > now) return;
+      points.forEach((p) => {
+        if (p.tv > now) return;
+        // poids reçu au moment (ou juste après) la réception de cette visite
         let w = null;
-        for (let j = 0; j < wHist.length; j++) { if (wHist[j].t >= t - 60000) { w = wHist[j].v; break; } }
-        catVisits.push({ cat: k.name, catId: k.id, t, w });
+        for (let j = 0; j < wHist.length; j++) {
+          if (wHist[j].t >= p.tr - 120000) { w = wHist[j].v; break; }
+        }
+        if (w === null) w = wHist.length ? wHist[wHist.length - 1].v : null;
+        catVisits.push({ cat: k.name, catId: k.id, t: p.tv, w });
       });
     });
 
-    // 3. associer chaque épisode à une visite identifiée (le last_visit du chat
-    //    change à la sortie, donc pendant l'épisode ou juste après)
-    const matchedVisits = new Set();
-    episodes.forEach((ep) => {
-      // marge : l'identification arrive parfois après le retour à idle
-      const match = catVisits
-        .filter((v) => !matchedVisits.has(v) && v.t >= ep.a - 120000 && v.t <= ep.b + 600000)
-        .sort((a, b) => Math.abs(a.t - ep.b) - Math.abs(b.t - ep.b))[0];
-      if (match) {
-        matchedVisits.add(match);
-        logs.push({ cat: match.cat, catId: match.catId, t: ep.a, until: ep.b, w: match.w, dur: ep.b - ep.a });
+    // 3. associer chaque épisode à une visite identifiée.
+    //    La VALEUR de last_visit = heure réelle de la visite (enregistrée à la
+    //    sortie, le cloud publie en lot avec ~10 min de retard). Appariement :
+    //    pour chaque visite (ordre chrono), l'épisode non pris le plus PROCHE
+    //    en distance (dans l'épisode = 0 ; sinon écart au bord le plus proche),
+    //    fenêtre de tolérance 2 min avant / 5 min après.
+    const dist = (v, ep) => (v >= ep.a && v <= ep.b) ? 0 : Math.min(Math.abs(v - ep.a), Math.abs(v - ep.b));
+    const epSorted = episodes.slice().sort((a, b) => a.a - b.a);
+    const vSorted = catVisits.slice().sort((a, b) => a.t - b.t);
+    const epTaken = new Set();
+    vSorted.forEach((v) => {
+      let best = null;
+      let bestD = Infinity;
+      epSorted.forEach((ep, i) => {
+        if (epTaken.has(i)) return;
+        if (v.t < ep.a - 120000 || v.t > ep.b + 300000) return;
+        const d = dist(v.t, ep);
+        if (d < bestD) { bestD = d; best = i; }
+      });
+      if (best !== null) {
+        epTaken.add(best);
+        const ep = epSorted[best];
+        logs.push({ cat: v.cat, catId: v.catId, t: ep.a, until: ep.b, w: v.w, dur: ep.b - ep.a });
       } else {
-        logs.push({ cat: null, catId: null, t: ep.a, until: ep.b, w: null, dur: ep.b - ep.a });
+        // visite sans épisode (recorder incomplet) : garder l'heure de visite
+        logs.push({ cat: v.cat, catId: v.catId, t: v.t, until: null, w: v.w, dur: null });
       }
     });
-    // visites identifiées orphelines (épisode manquant dans le recorder) :
-    // on les garde avec l'heure d'identification
-    catVisits.forEach((v) => {
-      if (!matchedVisits.has(v)) logs.push({ cat: v.cat, catId: v.catId, t: v.t, until: null, w: v.w, dur: null });
+    episodes.forEach((ep, i) => {
+      if (!epTaken.has(i)) logs.push({ cat: null, catId: null, t: ep.a, until: ep.b, w: null, dur: ep.b - ep.a });
     });
     logs.sort((a, b) => b.t - a.t);
     const logsLimited = logs.slice(0, 50);
