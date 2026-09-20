@@ -988,6 +988,8 @@ class NeakasaLitterCard extends HTMLElement {
       });
       logs.push({ cat, catId, t: g.t, tr: g.tr, dur: null, w: weight, inferred: false, cloudOnly: true });
     });
+
+    logs.sort((a, b) => b.t - a.t); // tri chronologique final (le journal groupe par jour)
     const logsLimited = logs.slice(0, 120); // journal ET cadran partagent cette source
 
     return { now, today, dayIdx, visits, perDay, prev, cycles, lastClean, emptiedAt, sinceEmpty, binEta, cats, switches, needsCleaning, logs: logsLimited };
@@ -1404,6 +1406,7 @@ class NeakasaLitterCard extends HTMLElement {
 
 if (!customElements.get('neakasa-litter-card')) {
   customElements.define('neakasa-litter-card', NeakasaLitterCard);
+  console.info('[neakasa-litter-card] v3.7.1 chargée');
   window.customCards = window.customCards || [];
   window.customCards.push({
     type: 'neakasa-litter-card',
