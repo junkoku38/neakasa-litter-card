@@ -942,7 +942,52 @@ class NeakasaLitterCard extends HTMLElement {
         logs.push({ cat, catId, t: ep.a, dur: ep.b - ep.a, w: weight, inferred: false });
       });
 
-    logs.sort((a, b) => b.t - a.t);
+    // E. passages « cloud seul » : le capteur GLOBAL last_visit donne l'heure
+    // d'entrée exacte de la dernière visite comptée. Quand le compteur a
+    // progressé pour un point qui ne correspond à aucune visite déjà
+    // reconstruite (ni par relevé chat, ni par épisode de présence — le
+    // capteur a raté l'entrée), on affiche quand même le passage, à l'heure
+    // exacte du cloud, sans durée. Sans cela, le journal compte moins de
+    // passages que l'application Neakasa (qui, elle, voit tout).
+    const cloudSeen = new Set();
+    logs.forEach((l) => {
+      if (l.inferred) return;
+      // heure d'entrée arrondie à la minute (les relevés chat et le global
+      // portent la même valeur pour la même visite)
+      cloudSeen.add(Math.round(l.t / 60000));
+    });
+    const globalPts = [];
+    (H[e.last_usage] || []).forEach((x) => {
+      const t = Date.parse(x.s);
+      if (!isNaN(t) && t <= now && dayIdx(t) >= 0 && dayIdx(t) <= 6) globalPts.push({ t, tr: ts(x) });
+    });
+    const curG = Date.parse(S[e.last_usage]?.state);
+    if (!isNaN(curG) && curG <= now && dayIdx(curG) >= 0 && dayIdx(curG) <= 6) {
+      globalPts.push({ t: curG, tr: Date.parse(S[e.last_usage].last_updated) || now });
+    }
+    globalPts.sort((a, b) => a.tr - b.tr);
+    const gSeen = new Set();
+    globalPts.forEach((g) => {
+      if (gSeen.has(g.t)) return;
+      gSeen.add(g.t);
+      if (cloudSeen.has(Math.round(g.t / 60000))) return;    // déjà dans le journal
+      // une pesée reçue dans le lot identifie le chat
+      const w = counterWindows.find((x) => inWindow(g.tr, x) && x.extra > 0);
+      if (!w) return;                                        // pas comptée par le cloud → faux positif évité
+      w.extra -= 1;
+      let cat = null, catId = null, weight = null;
+      (this._catsList || []).forEach((k) => {
+        if (cat || !k.id) return;
+        const progressed = (H[k.visitId] || []).some((x) => inWindow(ts(x), w));
+        if (progressed) return;
+        (H[k.id] || []).forEach((x) => {
+          const t = ts(x);
+          const v = parseFloat(x.s);
+          if (inWindow(t, w) && !isNaN(v) && v > 0) { cat = k.name; catId = k.id; weight = v; }
+        });
+      });
+      logs.push({ cat, catId, t: g.t, tr: g.tr, dur: null, w: weight, inferred: false, cloudOnly: true });
+    });
     const logsLimited = logs.slice(0, 120); // journal ET cadran partagent cette source
 
     return { now, today, dayIdx, visits, perDay, prev, cycles, lastClean, emptiedAt, sinceEmpty, binEta, cats, switches, needsCleaning, logs: logsLimited };
