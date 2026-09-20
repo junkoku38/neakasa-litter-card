@@ -188,8 +188,17 @@ const NK_CSS = `
   .logs::-webkit-scrollbar { width: 4px; }
   .logs::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); border-radius: 2px; }
   .clockbig { flex: 1; min-height: 0; display: grid; place-items: center; padding: 4px 18px; }
-  .clockbig svg { width: min(88vw, 76vh, 560px); height: auto; overflow: visible; }
+  .clockwrap { position: relative; }
+  .clockwrap svg { display: block; width: min(90vmin, 680px); height: auto; max-height: calc(100dvh - 240px); overflow: visible; }
   .clockbig .big-hl { font-size: 11px; }
+  .wtip {
+    position: absolute; transform: translate(-50%, -135%); pointer-events: none; white-space: nowrap;
+    background: #24272d; border: 1px solid rgba(255,255,255,.14); border-radius: 10px;
+    padding: 7px 11px; font-size: 13px; color: var(--nk-text); box-shadow: 0 6px 18px rgba(0,0,0,.45);
+  }
+  .wtip .s { color: var(--nk-dim); font-size: 11.5px; margin-top: 2px; }
+  .clock-full { position: fixed; inset: 0; z-index: 2147483000; border-radius: 0; background: rgba(14,15,17,.97); }
+  .clock-full .close { width: 46px; height: 46px; --mdc-icon-size: 22px; }
   .clocklegend { display: flex; flex-wrap: wrap; gap: 8px 16px; justify-content: center; padding: 0 18px 16px; flex: none; }
   .clocklegend .lg { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--nk-text); }
   .clocklegend .lg i { width: 9px; height: 9px; border-radius: 50%; flex: none; }
@@ -1317,6 +1326,7 @@ class NeakasaLitterCard extends HTMLElement {
         ${this._showLogs ? this._logsSheet(D) : ''}
         ${this._showClock ? this._clockSheet(D) : ''}
       </ha-card>`;
+    if (this._showClock) this._bindClockTips();
   }
 
   /* ───────────── Journal des passages (sheet plein écran carte) ───────────── */
@@ -1373,15 +1383,40 @@ class NeakasaLitterCard extends HTMLElement {
       </div>`;
   }
 
-  /* ───────────── Cadran agrandi (sheet plein écran carte) ───────────── */
+  /* ───────────── Cadran agrandi (overlay plein écran) ───────────── */
   _clockSheet(D) {
     const busy = NK_BUSY.includes(this._hass.states[this._config.entities.status]?.state);
-    // même cadran, viewBox ×2 (le SVG est vectoriel : rendu net en grand)
+    // points interactifs : chaque passage porte chat + date/heure
+    const fmtDay = (t) => new Date(t).toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' });
+    const fmtTime = (t) => new Date(t).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
     const small = this._clock(D, busy);
+    // transformer les points du cadran en éléments interactifs avec data
+    const ptsInfo = [];
+    (D.logs || []).forEach((l) => {
+      const i = D.dayIdx(l.t);
+      if (i < 0 || i > 6) return;
+      ptsInfo.push({ l, i });
+    });
+    let pi = 0;
     const big = small
-      .replace('aria-hidden="true"', 'role="img" aria-label="Passages des 7 derniers jours par heure, chaque anneau est un jour"')
-      .replace(/class="hl"/g, 'class="hl big-hl"');
-    // légende : un point par chat + anneaux par jour
+      .replace('aria-hidden="true"', 'role="img" aria-label="Passages des 7 derniers jours par heure"')
+      .replace(/class="hl"/g, 'class="hl big-hl"')
+      // chaque <circle> de passage devient un <g> interactif avec tooltip
+      .replace(/<circle cx="([\d.]+)" cy="([\d.]+)" r="([\d.]+)" fill="([^"]+)" opacity="([^"]+)"\/>/g, (m, cx, cy, r, fill, op) => {
+        const p = ptsInfo[pi++];
+        if (!p) return m;
+        const t = p.l.t;
+        const dayLabel = fmtDay(t);
+        const timeLabel = fmtTime(t);
+        const who = p.l.cat || 'Chat non identifié';
+        const dur = p.l.dur ? ' · ' + nkSpan(p.l.dur) : '';
+        const w = p.l.w != null ? ' · ' + nkNum(p.l.w, 2) + ' kg' : '';
+        return `<g class="pt" tabindex="0" role="button" data-tip="${who}${dur}${w}" data-tip2="${dayLabel} · ${timeLabel}">
+          <circle cx="${cx}" cy="${cy}" r="${(+r + 6).toFixed(1)}" fill="transparent"/>
+          <circle cx="${cx}" cy="${cy}" r="${r}" fill="${fill}" opacity="${op}"/>
+        </g>`;
+      });
+    // légende
     const catsSeen = [...new Set(D.logs.filter((l) => l.cat).map((l) => l.cat))];
     let legendCats = (this._catsList || []).filter((k) => catsSeen.includes(k.name)).map((k) => {
       const s = this._sexOf?.[k.name];
@@ -1389,17 +1424,55 @@ class NeakasaLitterCard extends HTMLElement {
       return `<span class="lg"><i style="background:${col}"></i>${k.name}</span>`;
     }).join('');
     if (D.logs.some((l) => !l.cat)) legendCats += '<span class="lg"><i style="background:var(--nk-sand);opacity:.5"></i>non identifié</span>';
-    return `<div class="sheet">
+    return `<div class="clock-full" data-clockfull="1">
       <div class="sheet-head">
         <div style="flex:1">
           <div class="t">Passages · 7 jours</div>
-          <div class="s">Chaque anneau est un jour (le plus extérieur = aujourd'hui) · l'angle donne l'heure</div>
+          <div class="s">Anneaux = jours (extérieur = aujourd'hui) · angle = heure · touchez un point pour le détail</div>
         </div>
         <button class="close" data-close="1" aria-label="Fermer"><ha-icon icon="mdi:close"></ha-icon></button>
       </div>
-      <div class="clockbig">${big}</div>
+      <div class="clockbig" data-clockbg="1">
+        <div class="clockwrap">${big}<div class="wtip" data-tipbox="1" hidden></div></div>
+      </div>
       <div class="clocklegend">${legendCats}</div>
     </div>`;
+  }
+
+  /* tooltip du cadran : survol (desktop) et touch (mobile) */
+  _bindClockTips() {
+    const root = this.shadowRoot;
+    const full = root.querySelector('[data-clockfull]');
+    if (!full) return;
+    const box = full.querySelector('[data-tipbox]');
+    const show = (pt) => {
+      box.hidden = false;
+      box.innerHTML = `<div>${pt.dataset.tip}</div><div class="s">${pt.dataset.tip2}</div>`;
+      // position : au-dessus du point, dans les limites du conteneur
+      const wrap = full.querySelector('.clockwrap');
+      const wr = wrap.getBoundingClientRect();
+      const pr = pt.getBoundingClientRect();
+      let x = pr.left + pr.width / 2 - wr.left;
+      let y = pr.top - wr.top;
+      const W = wr.width, H = wr.height;
+      x = Math.max(70, Math.min(W - 70, x));
+      if (y < 60) y = pr.bottom - wr.top; // trop haut → sous le point
+      box.style.left = x + 'px';
+      box.style.top = y + 'px';
+    };
+    const hide = () => { box.hidden = true; };
+    full.querySelectorAll('.pt').forEach((pt) => {
+      pt.addEventListener('pointerenter', () => show(pt));
+      pt.addEventListener('pointerleave', hide);
+      pt.addEventListener('click', (ev) => { ev.stopPropagation(); show(pt); setTimeout(hide, 2600); });
+      pt.addEventListener('focus', () => show(pt));
+      pt.addEventListener('blur', hide);
+    });
+    // fermer : clic sur le fond (pas un point), Échap déjà géré au keydown global
+    full.querySelector('[data-clockbg]').addEventListener('click', (ev) => {
+      if (ev.target.closest('.pt')) return;
+      this._showClock = false; this._render();
+    });
   }
 
   _onClean() {
