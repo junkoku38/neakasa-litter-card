@@ -187,6 +187,12 @@ const NK_CSS = `
   .logs { flex: 1; overflow-y: auto; padding: 6px 18px 18px; }
   .logs::-webkit-scrollbar { width: 4px; }
   .logs::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); border-radius: 2px; }
+  .clockbig { flex: 1; min-height: 0; display: grid; place-items: center; padding: 4px 18px; }
+  .clockbig svg { width: min(88vw, 76vh, 560px); height: auto; overflow: visible; }
+  .clockbig .big-hl { font-size: 11px; }
+  .clocklegend { display: flex; flex-wrap: wrap; gap: 8px 16px; justify-content: center; padding: 0 18px 16px; flex: none; }
+  .clocklegend .lg { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--nk-text); }
+  .clocklegend .lg i { width: 9px; height: 9px; border-radius: 50%; flex: none; }
   .day { font-size: 11px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; color: var(--nk-faint); margin: 16px 0 6px; }
   .log {
     display: flex; align-items: center; gap: 12px; padding: 9px 0; min-width: 0;
@@ -241,6 +247,7 @@ class NeakasaLitterCard extends HTMLElement {
     this._connected = false;
     this._fetching = false;
     this._showLogs = false;
+    this._showClock = false;
   }
 
   setConfig(config) {
@@ -341,6 +348,7 @@ class NeakasaLitterCard extends HTMLElement {
     root.addEventListener('click', (ev) => {
       if (ev.target.closest('[data-close]')) { this._showLogs = false; this._render(); return; }
       if (ev.target.closest('[data-logs]')) { this._showLogs = true; this._render(); return; }
+      if (ev.target.closest('[data-clock]')) { this._showClock = true; this._render(); return; }
       const btn = ev.target.closest('.btn');
       if (btn) {
         if (btn.dataset.act === 'level') this._onLevel();
@@ -354,9 +362,11 @@ class NeakasaLitterCard extends HTMLElement {
     });
     root.addEventListener('keydown', (ev) => {
       if (ev.key === 'Escape' && this._showLogs) { this._showLogs = false; this._render(); return; }
+      if (ev.key === 'Escape' && this._showClock) { this._showClock = false; this._render(); return; }
       if (ev.key !== 'Enter' && ev.key !== ' ') return;
-      if (ev.target.closest?.('[data-close]')) { ev.preventDefault(); this._showLogs = false; this._render(); return; }
+      if (ev.target.closest?.('[data-close]')) { ev.preventDefault(); this._showLogs = false; this._showClock = false; this._render(); return; }
       if (ev.target.closest?.('[data-logs]')) { ev.preventDefault(); this._showLogs = true; this._render(); return; }
+      if (ev.target.closest?.('[data-clock]')) { ev.preventDefault(); this._showClock = true; this._render(); return; }
       const tg = ev.target.closest?.('[data-toggle]');
       if (tg) { ev.preventDefault(); this._onToggle(tg.dataset.toggle); return; }
       const t = ev.target.closest?.('[data-more]');
@@ -1248,7 +1258,7 @@ class NeakasaLitterCard extends HTMLElement {
         </div>
 
         <div class="main">
-          <div class="clock" data-more="${e.last_usage}" tabindex="0" role="button" aria-label="Passages des 7 derniers jours selon l'heure">
+          <div class="clock" data-clock="1" tabindex="0" role="button" aria-label="Passages des 7 derniers jours selon l'heure — cliquer pour agrandir" title="Cliquer pour agrandir">
             ${this._clock(D, busy)}
             <div class="center">${center}</div>
           </div>
@@ -1305,6 +1315,7 @@ class NeakasaLitterCard extends HTMLElement {
         </div>` : ''}
 
         ${this._showLogs ? this._logsSheet(D) : ''}
+        ${this._showClock ? this._clockSheet(D) : ''}
       </ha-card>`;
   }
 
@@ -1362,6 +1373,35 @@ class NeakasaLitterCard extends HTMLElement {
       </div>`;
   }
 
+  /* ───────────── Cadran agrandi (sheet plein écran carte) ───────────── */
+  _clockSheet(D) {
+    const busy = NK_BUSY.includes(this._hass.states[this._config.entities.status]?.state);
+    // même cadran, viewBox ×2 (le SVG est vectoriel : rendu net en grand)
+    const small = this._clock(D, busy);
+    const big = small
+      .replace('aria-hidden="true"', 'role="img" aria-label="Passages des 7 derniers jours par heure, chaque anneau est un jour"')
+      .replace(/class="hl"/g, 'class="hl big-hl"');
+    // légende : un point par chat + anneaux par jour
+    const catsSeen = [...new Set(D.logs.filter((l) => l.cat).map((l) => l.cat))];
+    let legendCats = (this._catsList || []).filter((k) => catsSeen.includes(k.name)).map((k) => {
+      const s = this._sexOf?.[k.name];
+      const col = (s && NK_SEX_COLOR[s]) || 'var(--nk-sand)';
+      return `<span class="lg"><i style="background:${col}"></i>${k.name}</span>`;
+    }).join('');
+    if (D.logs.some((l) => !l.cat)) legendCats += '<span class="lg"><i style="background:var(--nk-sand);opacity:.5"></i>non identifié</span>';
+    return `<div class="sheet">
+      <div class="sheet-head">
+        <div style="flex:1">
+          <div class="t">Passages · 7 jours</div>
+          <div class="s">Chaque anneau est un jour (le plus extérieur = aujourd'hui) · l'angle donne l'heure</div>
+        </div>
+        <button class="close" data-close="1" aria-label="Fermer"><ha-icon icon="mdi:close"></ha-icon></button>
+      </div>
+      <div class="clockbig">${big}</div>
+      <div class="clocklegend">${legendCats}</div>
+    </div>`;
+  }
+
   _onClean() {
     const e = this._config.entities;
     if (!this._hass.states[e.clean]) return;
@@ -1406,7 +1446,7 @@ class NeakasaLitterCard extends HTMLElement {
 
 if (!customElements.get('neakasa-litter-card')) {
   customElements.define('neakasa-litter-card', NeakasaLitterCard);
-  console.info('[neakasa-litter-card] v3.7.1 chargée');
+  console.info('[neakasa-litter-card] v3.8.0 chargée');
   window.customCards = window.customCards || [];
   window.customCards.push({
     type: 'neakasa-litter-card',
