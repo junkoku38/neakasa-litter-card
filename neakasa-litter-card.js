@@ -21,6 +21,22 @@
  *   - histogramme des passages sur 7 jours
  *   - fiabilisation : delta de poids calculé sur la vraie période, garde-fous
  *     (entités manquantes, horodatages futurs, timers, accessibilité clavier)
+ *
+ * v3.7 :
+ *   - poids : tolérance de lot cloud — last_visit et weight arrivent dans le
+ *     même poll avec des horodatages quasi identiques ; l'égalité stricte
+ *     décalait tous les poids d'une visite
+ *   - épisodes partagés : plusieurs chats peuvent être rattachés au même
+ *     épisode de présence, chaque visite bornée par la suivante (durées
+ *     honnêtes au lieu d'offrir l'épisode entier au premier chat)
+ *   - compteurs : visites soustraites des fenêtres de polls par leur heure
+ *     de RÉCEPTION (une seule fenêtre chacune, tolérance de lot côté bord
+ *     droit) — les incrément orphelins sont maintenant attribués
+ *   - identification : un épisode libre dont le relevé par chat n'a pas
+ *     progressé mais dont une pesée est arrivée dans la fenêtre est attribué
+ *     au chat pesé (sinon « non identifié », comme avant)
+ *   - cycles de nettoyage : les « restoring » isolés sans phase de travail
+ *     ne comptent plus (prévision du bac plus juste)
  */
 
 const NK_BUSY = ['cleaning', 'leveling', 'flipover', 'restoring'];
@@ -502,17 +518,23 @@ class NeakasaLitterCard extends HTMLElement {
     }
     const prev = perDay.slice(1).filter((n) => n > 0);
 
-    // Cycles de nettoyage (états « busy » fusionnés)
+    // Cycles de nettoyage (états « busy » fusionnés). Un cycle ne compte
+    // que s'il contient une vraie phase de travail (cleaning / leveling /
+    // flipover) : les « restoring » isolés — remise en place sans nettoyage
+    // — gonflaient artificiellement le compteur de cycles (prévision bac).
     const sh = (H[e.status] || []).map((x) => ({ t: ts(x), s: x.s }));
-    const cycles = [];
-    let lastClean = null;
+    const rawCycles = [];
     sh.forEach((x, i) => {
       if (!NK_BUSY.includes(x.s)) return;
       const end = sh[i + 1]?.t ?? null;
-      const last = cycles[cycles.length - 1];
-      if (last && x.t - (last.b ?? x.t) < 30000) last.b = end;
-      else cycles.push({ a: x.t, b: end });
+      const last = rawCycles[rawCycles.length - 1];
+      if (last && x.t - (last.b ?? x.t) < 30000) { last.b = end; last.s.add(x.s); }
+      else rawCycles.push({ a: x.t, b: end, s: new Set([x.s]) });
     });
+    const cycles = rawCycles
+      .filter((c) => ['cleaning', 'leveling', 'flipover'].some((s) => c.s.has(s)))
+      .map(({ a, b }) => ({ a, b }));
+    let lastClean = null;
     cycles.forEach((c) => { if (c.b) lastClean = c.b; });
 
     // Dernier vidage du bac : legacy = passage full/missing → normal ;
@@ -596,6 +618,11 @@ class NeakasaLitterCard extends HTMLElement {
      *  D. le reste = passages non identifiés ; micro-présences ignorées. */
     const logs = [];
     const CAT_IN_STATES = ['cat_present', 'cat_appears'];
+    // Tolérance de lot cloud : dans un même poll, les entités (compteur,
+    // last_visit, weight) sont écrites avec des horodatages quasi identiques
+    // (écart < 1 ms) mais d'ordre interne aléatoire. Toute comparaison entre
+    // horodatages d'un même lot doit tolérer cet écart.
+    const LOT = 3000;
 
     // 1. épisodes de présence
     const episodes = [];
@@ -645,6 +672,11 @@ class NeakasaLitterCard extends HTMLElement {
       // récente, parfois avec plusieurs minutes de retard). La pesée d'une
       // visite n'est valable que si aucune visite plus récente n'a été reçue
       // entre la visite et la pesée.
+      // NB : last_visit et weight arrivent souvent dans le MÊME lot cloud,
+      // avec des horodatages quasi identiques (écart < 1 ms) mais d'ordre
+      // interne aléatoire. Une comparaison stricte w >= nextTr laissait
+      // alors la pesée du lot N « entrer » dans la fenêtre de la visite N-1
+      // et décalait tous les poids d'une visite.
       const wOf = [];
       points.forEach((p, i) => {
         if (p.tv > now) return;
@@ -653,46 +685,71 @@ class NeakasaLitterCard extends HTMLElement {
         const nextTr = i + 1 < points.length ? points[i + 1].tr : Infinity;
         // dernière pesée reçue entre cette visite et la suivante
         for (let j = wHist.length - 1; j >= 0; j--) {
-          if (wHist[j].t >= nextTr) continue;      // pesée d'une visite suivante
-          if (wHist[j].t < p.tr - 60000) break;      // plus ancienne que la visite → pesée d'une visite antérieure
+          if (wHist[j].t >= nextTr - LOT) continue; // pesée d'une visite suivante (ou du même lot)
+          if (wHist[j].t < p.tr - LOT - 60000) break; // plus ancienne que la visite → pesée d'une visite antérieure
           w = wHist[j].v;
           break;
         }
         wOf.push({ ...p, w });
       });
-      wOf.forEach((p) => catVisits.push({ cat: k.name, catId: k.id, t: p.tv, w: p.w }));
+      wOf.forEach((p) => catVisits.push({ cat: k.name, catId: k.id, t: p.tv, tr: p.tr, w: p.w }));
     });
 
     // A+B. appariement visites ↔ épisodes. L'horodatage cloud = heure
     // d'entrée (± drift d'horloge). Priorité : épisode CONTENANT la visite ;
-    // à défaut, le plus proche du DÉBUT d'épisode (≤ 3 min, drift max).
-    const epFree = new Set(episodes.map((_, i) => i));
+    // à défaut, le plus proche du DÉBUT d'épisode (≤ 10 min, drift max).
+    // Un épisode peut contenir PLUSIEURS visites (deux chats dans la litière
+    // l'un après l'autre, voire en même temps) : chaque visite trouve son
+    // épisode par elle-même. Un épisode ayant reçu une visite connue est
+    // « occupé » : les étapes C/D ne lui attribuent plus de visites perdues.
+    const epTaken = new Set();
     const take = (v) => {
+      // 1. épisode contenant la visite (prise en priorité)
       let hit = null;
-      // 1. épisode contenant la visite
       episodes.forEach((ep, i) => {
-        if (hit !== null || !epFree.has(i)) return;
+        if (hit !== null) return;
         if (v.t >= ep.a - 60000 && v.t <= ep.b + 60000) hit = i;
       });
       // 2. sinon : le plus proche du début, ≤ 10 min (l'entrée peut précéder
       //    l'horodatage cloud — pesée en cours de visite, lots retardés)
+      let byProximity = false;
       if (hit === null) {
         let best = Infinity;
         episodes.forEach((ep, i) => {
-          if (!epFree.has(i)) return;
           const d = Math.abs(v.t - ep.a);
           if (d <= 600000 && d < best) { best = d; hit = i; }
         });
+        byProximity = hit !== null;
       }
       if (hit !== null) {
-        epFree.delete(hit);
-        const ep = episodes[hit];
-        logs.push({ cat: v.cat, catId: v.catId, t: v.t, dur: ep.b - ep.a, w: v.w, inferred: false, epIdx: hit });
+        const shared = logs.some((l) => l.epIdx === hit);
+        // La visite n'est rattachée à cet épisode que par proximité : si son
+        // entrée est APRÈS la fin de l'épisode, l'épisode ne la contient pas
+        // (entrée non détectée par le capteur de présence) — il reste
+        // disponible pour les visites perdues des étapes C/D.
+        if (!byProximity || v.t <= episodes[hit].b + 60000) epTaken.add(hit);
+        logs.push({ cat: v.cat, catId: v.catId, t: v.t, tr: v.tr, dur: null, w: v.w, inferred: false, epIdx: hit, shared });
       } else {
-        logs.push({ cat: v.cat, catId: v.catId, t: v.t, dur: null, w: v.w, inferred: false });
+        logs.push({ cat: v.cat, catId: v.catId, t: v.t, tr: v.tr, dur: null, w: v.w, inferred: false });
       }
     };
     catVisits.slice().sort((a, b) => a.t - b.t).forEach((v) => take(v));
+    // Durées : pour chaque épisode, la première visite entrée prend la
+    // durée du début de l'épisode à son entrée + la suivante ; en cas
+    // d'épisode partagé, chaque visite est bornée par la visite suivante
+    // du même épisode (ordre chronologique) — plus honnête que d'offrir
+    // les 20 min de l'épisode entier à chaque chat.
+    const byEp = {};
+    logs.forEach((l) => { if (l.epIdx !== undefined) (byEp[l.epIdx] = byEp[l.epIdx] || []).push(l); });
+    Object.values(byEp).forEach((group) => {
+      const ep = episodes[group[0].epIdx];
+      group.sort((a, b) => a.t - b.t);
+      group.forEach((l, i) => {
+        const end = i + 1 < group.length ? group[i + 1].t : ep.b;
+        const start = i === 0 ? Math.max(ep.a, l.t) : l.t;
+        l.dur = end && end > start ? end - start : null;
+      });
+    });
 
     // C. visites perdues, par chat et par jour, via les compteurs
     const lost = {}; // catId -> { day -> perdus }
@@ -733,10 +790,12 @@ class NeakasaLitterCard extends HTMLElement {
       return next;
     };
 
-    // C bis. passages multiples dans un même épisode : si le chat a encore des
-    // visites perdues et que sa pesée connue est ≥ 5 min APRÈS l'entrée de
-    // l'épisode apparié, l'épisode a contenu plusieurs passages — l'entrée de
-    // l'épisode est le premier (compteur : 2 visites, 1 pesée).
+    // C bis. passages multiples dans un même épisode NON PARTAGÉ : si le chat
+    // a encore des visites perdues et que sa pesée connue est ≥ 5 min APRÈS
+    // l'entrée de l'épisode apparié, l'épisode a contenu plusieurs passages —
+    // l'entrée de l'épisode est le premier (compteur : 2 visites, 1 pesée).
+    // Sur un épisode partagé (plusieurs chats identifiés dedans), la visite
+    // supplémentaire appartient à l'AUTRE chat : c'est l'étape C qui l'attribuera.
     Object.keys(lostKeys).forEach((kId) => {
       Object.keys(lostKeys[kId]).forEach((d) => {
         while ((lostKeys[kId][d] ?? 0) > 0) {
@@ -744,7 +803,7 @@ class NeakasaLitterCard extends HTMLElement {
           if (!k) break;
           // pesée connue de ce chat appariée à un épisode, sans doublon déjà déduit
           const target = logs.find((l) =>
-            l.catId === kId && !l.inferred && l.epIdx !== undefined
+            l.catId === kId && !l.inferred && l.epIdx !== undefined && !l.shared
             && !logs.some((m) => m.inferred && m.catId === kId && m.epIdx === l.epIdx)
             && (l.t - episodes[l.epIdx].a) >= 300000);
           if (!target) break;
@@ -759,8 +818,9 @@ class NeakasaLitterCard extends HTMLElement {
     // le plus proche est traité d'abord, chaque chat ne pouvant recevoir que
     // le nombre de visites qu'il a réellement perdues ce jour.
     // construire toutes les paires (épisode, chat, distance) possibles
+    const epFreeC = episodes.map((_, i) => i).filter((i) => !epTaken.has(i));
     const pairs = [];
-    [...epFree]
+    epFreeC
       .filter((i) => (episodes[i].b - episodes[i].a) >= 5000)
       .forEach((i) => {
         const ep = episodes[i];
@@ -776,11 +836,13 @@ class NeakasaLitterCard extends HTMLElement {
       });
     // traiter les paires les plus proches d'abord
     pairs.sort((a, b) => a.dist - b.dist);
+    const epFreeSet = new Set(epFreeC);
     pairs.forEach((p) => {
-      if (!epFree.has(p.ep)) return;
+      if (!epFreeSet.has(p.ep)) return;
       if ((lostKeys[p.k.id]?.[p.d] ?? 0) <= 0) return;
       lostKeys[p.k.id][p.d] -= 1;
-      epFree.delete(p.ep);
+      epFreeSet.delete(p.ep);
+      epTaken.add(p.ep);
       const ep = episodes[p.ep];
       logs.push({ cat: p.k.name, catId: p.k.id, t: ep.a, dur: ep.b - ep.a, w: null, inferred: true });
     });
@@ -816,18 +878,44 @@ class NeakasaLitterCard extends HTMLElement {
         counterWindows.push({ t0: pts[i - 1].t, t1: pts[i].t, extra: inc });
       }
     };
-    (this._catsList || []).forEach((k) => buildWindows(k.visitsId, k.visitsId));
+    // Étape D : seules les fenêtres du COMPTEUR GLOBAL font foi pour promouvoir
+    // un épisode libre — les compteurs par chat comptent les mêmes visites que
+    // le global et créaient des fenêtres en double, faussant les promotions.
+    // (Les compteurs par chat servent uniquement à lostKeys ci-dessus.)
     buildWindows(e.visits_today, e.visits_today);
 
-    // soustraire les passages déjà reconstruits de chaque fenêtre
-    const inWindow = (t, w) => t > w.t0 && t <= w.t1;
+    // soustraire les passages déjà reconstruits de chaque fenêtre.
+    // NB : une visite est « comptée » par le cloud au moment de sa RÉCEPTION
+    // (le lot la transporte) — pas à son heure d'entrée, qui peut précéder
+    // largement la fenêtre. On soustrait donc par tr (réception), avec
+    // l'heure d'entrée en secours pour les visites sans tr.
+    // Chaque visite n'est soustraite que d'UNE SEULE fenêtre : celle dont le
+    // bord droit (poll) est le premier à couvrir sa réception (tolérance de
+    // lot 3 s — le compteur peut être écrit juste avant le relevé de visite
+    // du même lot). Sans cela, les fenêtres adjacentes se volent mutuellement
+    // leurs visites et les incrément restent orphelins.
+    const subWindow = (t, w) => t > w.t0 && t <= w.t1 + LOT;
     counterWindows.forEach((w) => {
-      logs.forEach((l) => { if (inWindow(l.t, w)) w.extra -= 1; });
+      logs.forEach((l) => {
+        const t = l.tr ?? l.t;
+        if (!subWindow(t, w)) return;
+        // la fenêtre précédente la couvre aussi ? alors c'est elle la bonne
+        const prev = counterWindows.find((x) => x !== w && t > x.t0 && t <= x.t1 + LOT && x.t1 < w.t1);
+        if (prev) return;
+        w.extra -= 1;
+      });
     });
 
     // épisodes libres par fenêtre : les plus proches du bord droit (poll)
-    // d'abord — les visites d'un lot précèdent sa réception
-    [...epFree]
+    // d'abord — les visites d'un lot précèdent sa réception.
+    // Identification B5 : si le relevé PAR CHAT n'a pas progressé dans la
+    // fenêtre (le passage n'a pas été remonté au capteur du chat) mais
+    // qu'une pesée de ce chat a été reçue dans la même fenêtre, c'est lui
+    // le visiteur (le lot cloud emporte last_visit global + weight).
+    // Sinon, la pesée du poll correspond à une visite déjà attribuée : on
+    // reste « non identifié ».
+    const inWindow = (t, w) => t > w.t0 && t <= w.t1 + LOT;
+    [...epFreeSet]
       .map((i) => i)
       .sort((a, b) => episodes[b].a - episodes[a].a)
       .forEach((i) => {
@@ -836,8 +924,22 @@ class NeakasaLitterCard extends HTMLElement {
         const w = counterWindows.find((x) => x.extra > 0 && (inWindow(ep.a, x) || inWindow(ep.b, x) || (ep.a <= x.t0 && ep.b >= x.t1)));
         if (!w) return;
         w.extra -= 1;
-        epFree.delete(i);
-        logs.push({ cat: null, catId: null, t: ep.a, dur: ep.b - ep.a, w: null, inferred: false });
+        epFreeSet.delete(i);
+        epTaken.add(i);
+        let cat = null, catId = null, weight = null;
+        (this._catsList || []).forEach((k) => {
+          if (cat || !k.id) return;
+          // le relevé par chat n'a pas bougé dans cette fenêtre
+          const progressed = (H[k.visitId] || []).some((x) => inWindow(ts(x), w));
+          if (progressed) return;
+          // une pesée a été reçue dans la fenêtre
+          (H[k.id] || []).forEach((x) => {
+            const t = ts(x);
+            const v = parseFloat(x.s);
+            if (inWindow(t, w) && !isNaN(v) && v > 0) { cat = k.name; catId = k.id; weight = v; }
+          });
+        });
+        logs.push({ cat, catId, t: ep.a, dur: ep.b - ep.a, w: weight, inferred: false });
       });
 
     logs.sort((a, b) => b.t - a.t);
