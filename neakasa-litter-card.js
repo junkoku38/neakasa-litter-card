@@ -355,7 +355,7 @@ class NeakasaLitterCard extends HTMLElement {
     this._connected = true;
     const root = this.shadowRoot;
     root.addEventListener('click', (ev) => {
-      if (ev.target.closest('[data-close]')) { this._showLogs = false; this._render(); return; }
+      if (ev.target.closest('[data-close]')) { this._showLogs = false; this._showClock = false; this._render(); return; }
       if (ev.target.closest('[data-logs]')) { this._showLogs = true; this._render(); return; }
       if (ev.target.closest('[data-clock]')) { this._showClock = true; this._render(); return; }
       const btn = ev.target.closest('.btn');
@@ -1519,7 +1519,7 @@ class NeakasaLitterCard extends HTMLElement {
 
 if (!customElements.get('neakasa-litter-card')) {
   customElements.define('neakasa-litter-card', NeakasaLitterCard);
-  console.info('[neakasa-litter-card] v3.8.0 chargée');
+  console.info('[neakasa-litter-card] v3.8.2 chargée');
   window.customCards = window.customCards || [];
   window.customCards.push({
     type: 'neakasa-litter-card',
